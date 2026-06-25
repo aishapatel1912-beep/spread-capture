@@ -18,6 +18,7 @@ from config import (  # noqa: E402 — env must be loaded first
     ASSET_MAX_CUMULATIVE_LOSS,
     TRADING_ASSETS,
     TRADING_ASSETS_UPPER,
+    WORKER_CONFIGS,
     trading_assets_label,
     validate_trading_assets,
 )
@@ -70,6 +71,7 @@ try:
         collect_open_positions,
         get_trade_history,
         trade_history_backfill,
+        find_worker,
         find_worker_by_asset,
         asset_cooldown,
     )
@@ -86,6 +88,9 @@ except ImportError:
 
     def trade_history_backfill() -> int:  # type: ignore
         return 0
+
+    def find_worker(workers, asset, window):  # type: ignore
+        return None
 
     def find_worker_by_asset(workers, asset) -> "MarketWorker | None":  # type: ignore
         return None
@@ -117,7 +122,10 @@ def _bot_name_from_url(url: str) -> str:
 def _app_config_payload() -> dict:
     return {
         "trading_assets":           list(TRADING_ASSETS_UPPER),
-        "market_interval":          MARKET_INTERVAL_SLUG,
+        "workers":                  [
+            {"asset": w.asset.upper(), "window": w.window} for w in WORKER_CONFIGS
+        ],
+        "market_interval":          "5m",
         "trading_assets_label":     trading_assets_label(),
         "asset_max_cumulative_loss": ASSET_MAX_CUMULATIVE_LOSS,
         "asset_cooldown_minutes":   ASSET_COOLDOWN_MINUTES,
@@ -181,10 +189,10 @@ async def _initialize_bots():
         print("✅ AccountService ready.")
 
         # ── Per-asset market workers ──────────────────────────────────────
-        for asset in TRADING_ASSETS:
-            print(f"Initializing {asset.upper()} Bot...")
-            bots.append(_MarketWorker(asset, account))
-            print(f"✅ {asset.upper()} Bot initialized")
+        for wc in WORKER_CONFIGS:
+            print(f"Initializing {wc.asset.upper()} {wc.window} Bot...")
+            bots.append(_MarketWorker(wc, account))
+            print(f"✅ {wc.asset.upper()} {wc.window} Bot initialized")
 
         # ── Portfolio history backfill ────────────────────────────────────
         # Runs exactly once at startup.  Reads emiliano:{asset}:trades from
@@ -385,12 +393,12 @@ def get_global_stats() -> dict:
     total_trades = total_wins + total_losses
     win_rate     = round((total_wins / total_trades) * 100, 1) if total_trades > 0 else 0.0
 
-    assets_in_cooldown = 0
+    workers_in_cooldown = 0
     if asset_cooldown is not None:
         try:
-            for a in TRADING_ASSETS:
-                if asset_cooldown.get_status(a).get("cooldown_active"):
-                    assets_in_cooldown += 1
+            for wc in WORKER_CONFIGS:
+                if asset_cooldown.get_status(wc.asset, wc.window).get("cooldown_active"):
+                    workers_in_cooldown += 1
         except Exception:
             pass
 
@@ -406,7 +414,8 @@ def get_global_stats() -> dict:
         "win_rate":             win_rate,
         "trading_allowed":      _trading_ok,
         "trading_tz":           _TRADING_TZ_NAME,
-        "assets_in_cooldown":   assets_in_cooldown,
+        "assets_in_cooldown":   workers_in_cooldown,
+        "workers_in_cooldown":  workers_in_cooldown,
         "asset_max_loss":       ASSET_MAX_CUMULATIVE_LOSS,
         "asset_cooldown_minutes": ASSET_COOLDOWN_MINUTES,
     }
@@ -1289,16 +1298,17 @@ function renderPositions(positions) {
     const roi = Number(p.roi_pct) || 0;
     const pnl = Number(p.unrealized_pnl) || 0;
     const roiCls = roi >= 0 ? 'pos' : 'neg';
-    const pending = _cashoutPending.has(p.asset);
+    const pending = _cashoutPending.has(`${p.asset}:${p.window}`);
+    const cashoutKey = `${p.asset}:${p.window}`;
     const disabled = pending || !p.cashout_available;
     const btnLabel = pending ? 'Selling…' : 'Sell';
     const sideCls = p.side === 'YES' ? 'pm-side-yes' : 'pm-side-no';
     return `
-      <div class="pm-row" data-asset="${p.asset}">
+      <div class="pm-row" data-asset="${p.asset}" data-window="${p.window || '5m'}">
         <div class="pm-row-main">
           <div class="pm-row-title">${_shortMarket(p.market)}</div>
           <div class="pm-row-sub">
-            <span>${p.asset}</span>
+            <span>${p.asset} ${p.window || '5m'}</span>
             <span class="${sideCls}">${p.side}</span>
             <span>${_fmtCents(p.entry_price_cents)} → ${_fmtCents(p.current_price_cents)}</span>
             <span>${Number(p.size).toFixed(2)} sh</span>
@@ -1309,7 +1319,7 @@ function renderPositions(positions) {
           <span class="pm-row-meta ${roiCls}">${_fmtUsd(pnl, true)}</span>
         </div>
         <button class="pm-cashout-btn" ${disabled ? 'disabled' : ''}
-                onclick="cashoutPosition('${p.asset}')">${btnLabel}</button>
+                onclick="cashoutPosition('${p.asset}','${p.window || '5m'}')">${btnLabel}</button>
       </div>`;
   }).join('');
 }
@@ -1355,12 +1365,14 @@ function renderTradeHistory(trades) {
   }).join('');
 }
 
-async function cashoutPosition(asset) {
-  if (_cashoutPending.has(asset)) return;
-  _cashoutPending.add(asset);
+async function cashoutPosition(asset, window) {
+  const key = `${asset}:${window || '5m'}`;
+  if (_cashoutPending.has(key)) return;
+  _cashoutPending.add(key);
   renderPositions(window._lastPositions || []);
   try {
-    const res = await fetch('/api/positions/' + encodeURIComponent(asset.toLowerCase()) + '/cashout', {
+    const res = await fetch('/api/positions/' + encodeURIComponent(asset.toLowerCase()) + '/'
+      + encodeURIComponent((window || '5m').toLowerCase()) + '/cashout', {
       method: 'POST',
     });
     const data = await res.json();
@@ -1371,7 +1383,7 @@ async function cashoutPosition(asset) {
     alert('Cashout request failed');
     console.warn(e);
   } finally {
-    _cashoutPending.delete(asset);
+    _cashoutPending.delete(key);
     loadPositionsAndHistory();
   }
 }
@@ -1397,7 +1409,7 @@ function renderGlobalStats(g) {
   if (banner && dot && schedTxt) {
     const allowed  = g.trading_allowed ?? true;
     const tz       = g.trading_tz || 'UTC';
-    const inCd     = (g.assets_in_cooldown ?? 0) > 0;
+    const inCd     = (g.workers_in_cooldown ?? g.assets_in_cooldown ?? 0) > 0;
     if (allowed && !inCd) {
       banner.className   = banner.className.replace(
         /bg-\S+|text-\S+|border-\S+/g, '').trim() +
@@ -1418,7 +1430,7 @@ function renderGlobalStats(g) {
         ' bg-orange-950 text-orange-400 border border-orange-900';
       dot.className      = 'w-2 h-2 rounded-full bg-orange-400 inline-block flex-shrink-0';
       schedTxt.textContent =
-        `🛡️ ${g.assets_in_cooldown} asset(s) in COOLDOWN — new entries blocked for those assets. TP/SL continues.`;
+        `🛡️ ${g.workers_in_cooldown ?? g.assets_in_cooldown} worker(s) in COOLDOWN — new entries blocked. TP/SL continues.`;
     }
   }
 }
@@ -1428,6 +1440,9 @@ function renderGlobalStats(g) {
 // ═══════════════════════════════════════════════════════════════════
 function sigClass(s){
   if(!s)return'sig-neutral';const u=s.toUpperCase();
+  if(u.includes('STALE'))return'sig-neutral';
+  if(u.includes('BULL'))return'sig-strong-bull';
+  if(u.includes('BEAR'))return'sig-strong-bear';
   if(u.includes('STRONGLY')&&u.includes('BULL'))return'sig-strong-bull';
   if(u.includes('STRONGLY')&&u.includes('BEAR'))return'sig-strong-bear';
   if(u.includes('MILDLY')&&u.includes('BULL'))return'sig-mild-bull';
@@ -1436,6 +1451,9 @@ function sigClass(s){
 }
 function pillClass(s){
   if(!s)return'pill-neutral';const u=s.toUpperCase();
+  if(u.includes('STALE'))return'pill-neutral';
+  if(u.includes('BULL'))return'pill-strong-bull';
+  if(u.includes('BEAR'))return'pill-strong-bear';
   if(u.includes('STRONGLY')&&u.includes('BULL'))return'pill-strong-bull';
   if(u.includes('STRONGLY')&&u.includes('BEAR'))return'pill-strong-bear';
   if(u.includes('MILDLY')&&u.includes('BULL'))return'pill-mild-bull';
@@ -1444,6 +1462,9 @@ function pillClass(s){
 }
 function sigIcon(s){
   if(!s)return'—';const u=s.toUpperCase();
+  if(u.includes('STALE'))return'⚠️';
+  if(u.includes('BULL'))return'🚀';
+  if(u.includes('BEAR'))return'🔻';
   if(u.includes('STRONGLY')&&u.includes('BULL'))return'🚀';
   if(u.includes('STRONGLY')&&u.includes('BEAR'))return'🔻';
   if(u.includes('MILDLY')&&u.includes('BULL'))return'📈';
@@ -1502,10 +1523,12 @@ function renderCard(bot){
   const cdPnl=Number(bot.cooldown_window_pnl)||0;
   const cdPnlPos=cdPnl>=0;
   const border=inProfit?'border-l-4 border-emerald-500':inLoss?'border-l-4 border-red-500':inCooldown?'border-l-4 border-orange-500':hasPos?'border-l-4 border-sky-500':'';
-  const signal=bot.imbalance_signal||'NEUTRAL';
+  const signal=bot.momentum_signal||'NEUTRAL';
+  const stale=!!bot.signal_stale;
   const wins=bot.wins??0;const losses=bot.losses??0;
   const trades=bot.trade_count??0;const wr=bot.win_rate??0;
   const mw=formatMarketWindow(bot.market_start_iso,bot.market_end_iso);
+  const label=`${bot.asset||'BOT'} ${bot.window||'5m'}`;
   const badge=inProfit
     ?`<span class="text-xs bg-emerald-950 text-emerald-400 px-2 py-0.5 rounded-full font-semibold">🟢 IN PROFIT</span>`
     :inLoss
@@ -1524,7 +1547,7 @@ function renderCard(bot){
     <div class="${border} rounded-2xl pl-3">
       <div class="flex items-center justify-between mb-1">
         <div class="flex items-center gap-2 flex-wrap">
-          <span class="text-xl font-black tracking-tight" style="font-family:'Inter',system-ui,sans-serif;letter-spacing:-.02em;">${bot.asset||'BOT'}</span>
+          <span class="text-xl font-black tracking-tight" style="font-family:'Inter',system-ui,sans-serif;letter-spacing:-.02em;">${label}</span>
           ${badge}
         </div>
         <span class="text-zinc-500 text-xs font-mono">${bot.timer||'--:--'}</span>
@@ -1543,11 +1566,12 @@ function renderCard(bot){
       </div>
       <div class="bg-zinc-800 rounded-xl px-3 py-2 mb-3 flex items-center justify-between gap-2 flex-wrap">
         <span class="inline-flex items-center gap-1.5 text-sm font-semibold px-2.5 py-1 rounded-full ${pillClass(signal)}">
-          ${sigIcon(signal)} ${signal}
+          ${sigIcon(signal)} ${signal}${stale ? ' · STALE' : ''}
         </span>
         <div class="text-xs text-zinc-400 font-mono">
-          Imb <span class="${sigClass(signal)}">${(bot.imbalance_ratio||0).toFixed(3)}</span>
-          &nbsp;Mom <span class="${sigClass(signal)}">${(bot.imbalance_momentum||0).toFixed(3)}</span>
+          Δ <span class="${sigClass(signal)}">${(bot.price_delta_pct||0).toFixed(3)}%</span>
+          &nbsp;· ${bot.execution_mode||'single_taker'}
+          &nbsp;· lb ${bot.lookback_secs||'?'}s
         </div>
       </div>
       <div class="space-y-1.5 text-sm mb-3">
@@ -1659,12 +1683,32 @@ async def api_trades_history(limit: int = 10):
     return JSONResponse({"trades": get_trade_history(lim)})
 
 
-@app.post("/api/positions/{asset}/cashout")
-async def api_cashout(asset: str):
+@app.post("/api/positions/{asset}/{window}/cashout")
+async def api_cashout(asset: str, window: str):
     """
     Manual dashboard cashout — delegates to MarketWorker.manual_cashout()
     which uses the same _close_open_position() path as TP/SL exits.
     """
+    if not bots:
+        raise HTTPException(status_code=503, detail="Bots not initialized")
+    worker = find_worker(bots, asset, window)
+    if worker is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No bot for {asset!r} {window!r}",
+        )
+    try:
+        result = await worker.manual_cashout()
+        status = 200 if result.get("ok") else 409
+        return JSONResponse(result, status_code=status)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/positions/{asset}/cashout")
+async def api_cashout_legacy(asset: str):
+    """Legacy cashout route — first matching worker for asset (5m only deployments)."""
     if not bots:
         raise HTTPException(status_code=503, detail="Bots not initialized")
     worker = find_worker_by_asset(bots, asset)

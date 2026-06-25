@@ -1,29 +1,28 @@
 """
-Centralized trading-asset configuration.
-
-Environment (one of the following is required):
-
-  ASSET=BTC
-      Single Polymarket crypto up/down slug (btc, eth, sol, xrp).
-
-  TRADING_ASSETS=btc,eth,sol,xrp
-      Comma-separated list for multi-asset deployments.
-
-TRADING_ASSETS takes precedence when both are set.
+Centralized configuration: momentum JSON workers + .env secrets/globals.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Any, Literal, Optional, Tuple
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Slugs used in Polymarket market URLs: {asset}-updown-{interval}-{ts}
-SUPPORTED_TRADING_ASSETS: frozenset[str] = frozenset({"btc", "eth", "sol", "xrp", "doge", "hype", "bnb"})
+SUPPORTED_TRADING_ASSETS: frozenset[str] = frozenset(
+    {"btc", "eth", "sol", "xrp", "doge", "hype", "bnb"}
+)
+SUPPORTED_WINDOWS: frozenset[str] = frozenset({"5m"})
+WINDOW_SECONDS: dict[str, int] = {"5m": 300}
+MIN_SHARES: int = 5
+
+ExecutionMode = Literal["single_taker", "gtc_at_ask", "single_maker", "dual_hybrid"]
+StrategyName = Literal["momentum", "legacy"]
 
 _ASSET_ALIASES: dict[str, str] = {
     "bitcoin": "btc",
@@ -34,109 +33,254 @@ _ASSET_ALIASES: dict[str, str] = {
 
 
 def _fatal(message: str) -> None:
-    supported = ", ".join(sorted(SUPPORTED_TRADING_ASSETS))
-    print(
-        f"❌ [config] {message}\n"
-        f"   Set ASSET=BTC or TRADING_ASSETS={supported} in .env / Render environment.",
-        file=sys.stderr,
-    )
+    print(f"❌ [config] {message}", file=sys.stderr)
     sys.exit(1)
 
 
 def normalize_asset_slug(raw: str) -> str:
-    """Normalize a user-provided asset token to a supported lowercase slug."""
     token = (raw or "").strip().lower()
     if not token:
         raise ValueError("empty asset token")
     return _ASSET_ALIASES.get(token, token)
 
 
-def parse_trading_assets_from_env() -> Tuple[str, ...]:
-    """
-    Read TRADING_ASSETS or ASSET from the environment and return validated slugs.
-    """
-    multi_raw = os.getenv("TRADING_ASSETS", "").strip()
-    single_raw = os.getenv("ASSET", "").strip()
-
-    if multi_raw:
-        source = "TRADING_ASSETS"
-        raw_tokens = [part.strip() for part in multi_raw.split(",") if part.strip()]
-    elif single_raw:
-        source = "ASSET"
-        raw_tokens = [single_raw]
-    else:
-        _fatal(
-            "Missing required asset configuration. "
-            "Set ASSET (single asset) or TRADING_ASSETS (comma-separated list)."
-        )
-
-    if not raw_tokens:
-        _fatal(f"{source} is set but contains no asset tokens.")
-
-    normalized: list[str] = []
-    invalid: list[str] = []
-
-    for token in raw_tokens:
-        try:
-            slug = normalize_asset_slug(token)
-        except ValueError:
-            invalid.append(repr(token))
-            continue
-        if slug not in SUPPORTED_TRADING_ASSETS:
-            invalid.append(repr(token))
-            continue
-        if slug not in normalized:
-            normalized.append(slug)
-
-    if invalid:
-        supported = ", ".join(sorted(SUPPORTED_TRADING_ASSETS))
-        _fatal(
-            f"Invalid asset(s) in {source}: {', '.join(invalid)}. "
-            f"Supported slugs: {supported}."
-        )
-
-    if not normalized:
-        _fatal(f"No valid assets could be parsed from {source}.")
-
-    return tuple(normalized)
+def normalize_window(raw: str) -> str:
+    w = (raw or "").strip().lower()
+    if w not in SUPPORTED_WINDOWS:
+        raise ValueError(f"unsupported window {raw!r}")
+    return w
 
 
-TRADING_ASSETS: Tuple[str, ...] = parse_trading_assets_from_env()
-TRADING_ASSETS_UPPER: Tuple[str, ...] = tuple(a.upper() for a in TRADING_ASSETS)
-
-# Alias used by portfolio backfill / trade-history helpers in bot.py
-ALL_TRACKED_ASSETS = TRADING_ASSETS
-
-
-def asset_pnl_filename(asset: str) -> str:
-    return f"{normalize_asset_slug(asset)}_pnl_history.json"
-
-
-PNL_FILES: list[str] = [asset_pnl_filename(a) for a in TRADING_ASSETS]
-TOTAL_BOTS: int = len(TRADING_ASSETS)
-
-
-def binance_futures_symbol(asset: str) -> str:
-    """Binance USDT-margined futures base symbol (e.g. btc → BTC)."""
+def binance_spot_symbol(asset: str) -> str:
     return normalize_asset_slug(asset).split("-")[0].upper()
 
 
+def binance_futures_symbol(asset: str) -> str:
+    return binance_spot_symbol(asset)
+
+
+def worker_key(asset: str, window: str) -> str:
+    return f"{normalize_asset_slug(asset)}:{normalize_window(window)}"
+
+
+def _parse_positive_float(name: str, value: Any, *, allow_null: bool = False) -> Optional[float]:
+    if value is None:
+        return None if allow_null else _fatal(f"{name} is required.")
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        _fatal(f"{name}={value!r} is not a valid number.")
+    if v <= 0 or not (v == v) or v in (float("inf"), float("-inf")):
+        _fatal(f"{name} must be a positive number (got {value!r}).")
+    return v
+
+
+def _parse_positive_int(name: str, value: Any) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        _fatal(f"{name}={value!r} is not a valid integer.")
+    if v < MIN_SHARES:
+        _fatal(f"{name} must be >= {MIN_SHARES} (got {value!r}).")
+    return v
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
+DRY_RUN_DEFAULT: bool = _parse_bool_env("DRY_RUN_DEFAULT", _parse_bool_env("DRY_MODE", True))
+
+
+@dataclass(frozen=True)
+class WorkerConfig:
+    asset: str
+    window: str
+    strategy: StrategyName = "momentum"
+    lookback_secs: float = 3.0
+    entry_min_delta: float = 0.0015
+    execution_mode: ExecutionMode = "single_taker"
+    momentum_size: int = 10
+    max_buy_order_size: int = 10
+    dry_run: bool = DRY_RUN_DEFAULT
+    stop_loss_pct: float = 35.0
+    take_profit_pct: float = 35.0
+    listener_activate_secs: int = 300
+    entry_seconds_left: int = 300
+    min_entry_price: float = 0.90
+    enabled: bool = True
+
+    @property
+    def interval_seconds(self) -> int:
+        return WINDOW_SECONDS[self.window]
+
+    @property
+    def key(self) -> str:
+        return worker_key(self.asset, self.window)
+
+    def market_slug(self, start_ts: int) -> str:
+        return f"{self.asset}-updown-{self.window}-{start_ts}"
+
+
+def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
+    asset = normalize_asset_slug(str(raw.get("asset", "")))
+    if asset not in SUPPORTED_TRADING_ASSETS:
+        _fatal(f"Invalid asset {raw.get('asset')!r}. Supported: {sorted(SUPPORTED_TRADING_ASSETS)}")
+
+    try:
+        window = normalize_window(str(raw.get("window", "")))
+    except ValueError:
+        _fatal(
+            f"Invalid window {raw.get('window')!r} for {asset}. "
+            f"Supported: {sorted(SUPPORTED_WINDOWS)}"
+        )
+
+    strategy = str(raw.get("strategy", defaults.get("strategy", "momentum"))).lower()
+    if strategy not in ("momentum", "legacy"):
+        _fatal(f"Invalid strategy {strategy!r} for {asset}:{window}")
+
+    exec_mode = str(raw.get("execution_mode", defaults.get("execution_mode", "single_taker")))
+    allowed_modes = ("single_taker", "gtc_at_ask", "single_maker", "dual_hybrid")
+    if exec_mode not in allowed_modes:
+        _fatal(f"Invalid execution_mode {exec_mode!r} for {asset}:{window}")
+
+    lookback = _parse_positive_float(
+        "lookback_secs", raw.get("lookback_secs", defaults.get("lookback_secs", 3.0))
+    )
+    entry_delta = _parse_positive_float(
+        "entry_min_delta", raw.get("entry_min_delta", defaults.get("entry_min_delta", 0.0015))
+    )
+    momentum_size = _parse_positive_int(
+        "momentum_size", raw.get("momentum_size", defaults.get("momentum_size", 10))
+    )
+    max_buy = _parse_positive_int(
+        "max_buy_order_size", raw.get("max_buy_order_size", defaults.get("max_buy_order_size", 10))
+    )
+    if momentum_size > max_buy:
+        _fatal(
+            f"{asset}:{window}: momentum_size ({momentum_size}) "
+            f"cannot exceed max_buy_order_size ({max_buy})"
+        )
+
+    dr_raw = raw.get("dry_run", defaults.get("dry_run"))
+    if dr_raw is None:
+        dry_run = DRY_RUN_DEFAULT
+    else:
+        dry_run = bool(dr_raw)
+
+    interval = WINDOW_SECONDS[window]
+    listener_raw = raw.get("listener_activate_secs", defaults.get("listener_activate_secs"))
+    entry_raw = raw.get("entry_seconds_left", defaults.get("entry_seconds_left"))
+    env_listener = os.getenv("LISTENER_ACTIVATE_SECONDS", "").strip()
+    env_entry = os.getenv("ENTRY_SECONDS_LEFT", "").strip()
+    if listener_raw is not None:
+        listener_secs = int(listener_raw)
+    elif env_listener:
+        listener_secs = int(env_listener)
+    else:
+        listener_secs = interval
+    if entry_raw is not None:
+        entry_secs = int(entry_raw)
+    elif env_entry:
+        entry_secs = int(env_entry)
+    else:
+        entry_secs = interval
+
+    sl = float(raw.get("stop_loss_pct", defaults.get("stop_loss_pct", 35)))
+    tp = float(raw.get("take_profit_pct", defaults.get("take_profit_pct", 35)))
+    min_entry = float(raw.get("min_entry_price", defaults.get("min_entry_price", 0.90)))
+
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        enabled = str(enabled).lower() in ("1", "true", "yes", "on")
+
+    return WorkerConfig(
+        asset=asset,
+        window=window,
+        strategy=strategy,  # type: ignore[arg-type]
+        lookback_secs=float(lookback),
+        entry_min_delta=float(entry_delta),
+        execution_mode=exec_mode,  # type: ignore[arg-type]
+        momentum_size=momentum_size,
+        max_buy_order_size=max_buy,
+        dry_run=dry_run,
+        stop_loss_pct=sl,
+        take_profit_pct=tp,
+        listener_activate_secs=listener_secs,
+        entry_seconds_left=entry_secs,
+        min_entry_price=min_entry,
+        enabled=enabled,
+    )
+
+
+def load_worker_configs(path: Optional[str] = None) -> Tuple[WorkerConfig, ...]:
+    cfg_path = path or os.getenv("MOMENTUM_CONFIG_PATH", "momentum_config.json")
+    if not os.path.isfile(cfg_path):
+        _fatal(f"Momentum config not found: {cfg_path}")
+
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        _fatal(f"Invalid JSON in {cfg_path}: {e}")
+    except OSError as e:
+        _fatal(f"Cannot read {cfg_path}: {e}")
+
+    if not isinstance(data, dict):
+        _fatal(f"{cfg_path} must be a JSON object.")
+
+    defaults = data.get("defaults") or {}
+    workers_raw = data.get("workers")
+    if not isinstance(workers_raw, list) or not workers_raw:
+        _fatal(f"{cfg_path} must contain a non-empty 'workers' array.")
+
+    seen: set[str] = set()
+    out: list[WorkerConfig] = []
+    for entry in workers_raw:
+        if not isinstance(entry, dict):
+            _fatal("Each worker entry must be a JSON object.")
+        wc = _merge_worker_entry(entry, defaults)
+        if not wc.enabled:
+            continue
+        if wc.key in seen:
+            _fatal(f"Duplicate worker config: {wc.key}")
+        seen.add(wc.key)
+        out.append(wc)
+
+    if not out:
+        _fatal("No enabled workers in momentum config.")
+
+    return tuple(out)
+
+
+WORKER_CONFIGS: Tuple[WorkerConfig, ...] = load_worker_configs()
+TRADING_ASSETS: Tuple[str, ...] = tuple(dict.fromkeys(w.asset for w in WORKER_CONFIGS))
+TRADING_ASSETS_UPPER: Tuple[str, ...] = tuple(a.upper() for a in TRADING_ASSETS)
+ALL_TRACKED_ASSETS = TRADING_ASSETS
+TOTAL_BOTS: int = len(WORKER_CONFIGS)
+
+
+def asset_pnl_filename(asset: str, window: str = "5m") -> str:
+    a = normalize_asset_slug(asset)
+    w = normalize_window(window)
+    return f"{a}_{w}_pnl_history.json"
+
+
+PNL_FILES: list[str] = [asset_pnl_filename(w.asset, w.window) for w in WORKER_CONFIGS]
+
+
 def validate_trading_assets() -> Tuple[str, ...]:
-    """Explicit startup hook; configuration is validated at import time."""
     if not TRADING_ASSETS:
-        _fatal("TRADING_ASSETS resolved to an empty list.")
+        _fatal("No trading assets resolved from worker config.")
     return TRADING_ASSETS
 
 
 def trading_assets_label(separator: str = " · ") -> str:
-    return separator.join(TRADING_ASSETS_UPPER)
-
-
-# ── Asset-level circuit breaker / cooldown ───────────────────────────────────
-#
-# When an asset's cooldown-window realized PnL falls below -ASSET_MAX_CUMULATIVE_LOSS,
-# new entries for that asset are blocked for ASSET_COOLDOWN_MINUTES. Existing positions
-# continue to be managed (TP/SL, manual exit). See bot.AssetCooldownManager.
+    labels = [f"{w.asset.upper()} {w.window}" for w in WORKER_CONFIGS]
+    return separator.join(labels)
 
 
 def _parse_positive_float_env(name: str, default: float) -> float:
@@ -168,22 +312,20 @@ def _parse_positive_int_env(name: str, default: int) -> int:
 ASSET_MAX_CUMULATIVE_LOSS: float = _parse_positive_float_env(
     "ASSET_MAX_CUMULATIVE_LOSS", 3.00,
 )
-ASSET_COOLDOWN_MINUTES: int = _parse_positive_int_env(
-    "ASSET_COOLDOWN_MINUTES", 30,
-)
+ASSET_COOLDOWN_MINUTES: int = _parse_positive_int_env("ASSET_COOLDOWN_MINUTES", 30)
 ASSET_COOLDOWN_SECONDS: int = ASSET_COOLDOWN_MINUTES * 60
 
 
 def validate_asset_cooldown_config() -> tuple[float, int]:
-    """Explicit startup hook; values are validated at import time."""
     return ASSET_MAX_CUMULATIVE_LOSS, ASSET_COOLDOWN_MINUTES
 
 
 print(
-    f"📌 Trading assets ({len(TRADING_ASSETS)}): "
-    + ", ".join(TRADING_ASSETS_UPPER)
+    f"📌 Workers ({len(WORKER_CONFIGS)}): "
+    + ", ".join(f"{w.asset.upper()} {w.window}" for w in WORKER_CONFIGS)
 )
 print(
     f"🛡️  Asset cooldown: max loss ${ASSET_MAX_CUMULATIVE_LOSS:.2f} | "
-    f"cooldown {ASSET_COOLDOWN_MINUTES} min"
+    f"cooldown {ASSET_COOLDOWN_MINUTES} min (per asset+window)"
 )
+print(f"🧪 DRY_RUN_DEFAULT={DRY_RUN_DEFAULT}")

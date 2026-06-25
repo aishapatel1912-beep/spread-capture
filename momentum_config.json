@@ -1,0 +1,28 @@
+{
+  "defaults": {
+    "strategy": "momentum",
+    "lookback_secs": 3.0,
+    "entry_min_delta": 0.0015,
+    "execution_mode": "single_taker",
+    "momentum_size": 10,
+    "max_buy_order_size": 10,
+    "dry_run": null,
+    "stop_loss_pct": 35,
+    "take_profit_pct": 35,
+    "listener_activate_secs": null,
+    "entry_seconds_left": null,
+    "min_entry_price": 0.90
+  },
+  "workers": [
+    {
+      "asset": "sol",
+      "window": "5m",
+      "enabled": true
+    },
+    {
+      "asset": "xrp",
+      "window": "5m",
+      "enabled": true
+    }
+  ]
+}

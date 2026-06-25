@@ -34,14 +34,25 @@ from config import (
     ASSET_COOLDOWN_MINUTES,
     ASSET_COOLDOWN_SECONDS,
     ASSET_MAX_CUMULATIVE_LOSS,
+    DRY_RUN_DEFAULT,
+    MIN_SHARES,
     PNL_FILES,
     TOTAL_BOTS,
     TRADING_ASSETS,
     TRADING_ASSETS_UPPER,
+    WORKER_CONFIGS,
+    WorkerConfig,
+    asset_pnl_filename,
     binance_futures_symbol,
+    binance_spot_symbol,
     validate_asset_cooldown_config,
     validate_trading_assets,
+    worker_key,
 )
+from strategies.base import EntryDecision
+from strategies.legacy import LegacyStrategy
+from strategies.momentum import MomentumStrategy
+from utils.clob_helpers import clamp_buy_price, clamp_sell_price, parse_order_type
 
 console = Console()
 load_dotenv()
@@ -63,7 +74,7 @@ def exec_log(event: str, **kwargs):
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-DRY_MODE = os.getenv("DRY_MODE", "True").lower() == "true"
+DRY_MODE = DRY_RUN_DEFAULT
 LOG_FILE  = "emiliano_trades.txt"
 
 HOST        = "https://clob.polymarket.com"
@@ -370,23 +381,23 @@ _last_cooldown_log_ts: Dict[str, float] = {}
 _COOLDOWN_LOG_INTERVAL_SEC: float = 60.0
 
 
-def log_cooldown_block(asset_type: str, side: str, price_cents: int) -> None:
+def log_cooldown_block(asset_type: str, window: str, side: str, price_cents: int) -> None:
     """Emit a throttled log when new entries are blocked by asset cooldown."""
     global _last_cooldown_log_ts
-    asset_key = asset_type.lower()
+    block_key = worker_key(asset_type, window)
     now = t.time()
-    last = _last_cooldown_log_ts.get(asset_key, 0.0)
+    last = _last_cooldown_log_ts.get(block_key, 0.0)
     if now - last < _COOLDOWN_LOG_INTERVAL_SEC:
         return
-    _last_cooldown_log_ts[asset_key] = now
+    _last_cooldown_log_ts[block_key] = now
 
-    status = asset_cooldown.get_status(asset_key)
+    status = asset_cooldown.get_status(asset_type, window)
     until  = status.get("cooldown_until_utc") or "unknown"
     remaining = status.get("cooldown_remaining_sec", 0)
     window_pnl  = status.get("cooldown_window_pnl", 0.0)
 
     msg = (
-        f"🚫 [COOLDOWN] [{asset_type.upper()}] New-position entry BLOCKED — "
+        f"🚫 [COOLDOWN] [{asset_type.upper()} {window}] New-position entry BLOCKED — "
         f"cooldown window PnL ${window_pnl:.2f} (limit -${ASSET_MAX_CUMULATIVE_LOSS:.2f}). "
         f"Trading disabled until {until} UTC "
         f"({remaining // 60}m {remaining % 60}s remaining). "
@@ -397,6 +408,7 @@ def log_cooldown_block(asset_type: str, side: str, price_cents: int) -> None:
     exec_log(
         "entry_blocked_cooldown",
         asset=asset_type,
+        window=window,
         side=side,
         price_cents=price_cents,
         cooldown_window_pnl=window_pnl,
@@ -524,16 +536,20 @@ def redis_get_json(key: str) -> Optional[Any]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def _cooldown_redis_key(asset: str) -> str:
-    return f"emiliano:{asset.lower()}:cooldown"
+def _cooldown_redis_key(asset: str, window: str) -> str:
+    return f"emiliano:{asset.lower()}:{window.lower()}:cooldown"
 
 
-def _cooldown_local_path(asset: str) -> str:
-    return f"{asset.lower()}_cooldown_state.json"
+def _cooldown_local_path(asset: str, window: str) -> str:
+    return f"{asset.lower()}_{window.lower()}_cooldown_state.json"
+
+
+def _cooldown_state_key(asset: str, window: str) -> str:
+    return worker_key(asset, window)
 
 
 class AssetCooldownManager:
-    """Per-asset circuit breaker with Redis + local JSON persistence."""
+    """Per (asset, window) circuit breaker with Redis + local JSON persistence."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -548,20 +564,20 @@ class AssetCooldownManager:
             "last_updated":       None,
         }
 
-    def _load_state(self, asset: str) -> Dict[str, Any]:
-        asset = asset.lower()
+    def _load_state(self, asset: str, window: str) -> Dict[str, Any]:
+        key = _cooldown_state_key(asset, window)
         with self._lock:
-            if asset in self._state:
-                return dict(self._state[asset])
+            if key in self._state:
+                return dict(self._state[key])
 
         loaded: Optional[Dict[str, Any]] = None
         if _redis_available:
-            raw = redis_get_json(_cooldown_redis_key(asset))
+            raw = redis_get_json(_cooldown_redis_key(asset, window))
             if isinstance(raw, dict):
                 loaded = raw
 
         if loaded is None:
-            path = _cooldown_local_path(asset)
+            path = _cooldown_local_path(asset, window)
             try:
                 if os.path.exists(path):
                     with open(path, "r", encoding="utf-8") as f:
@@ -581,13 +597,13 @@ class AssetCooldownManager:
             state["breach_at"]    = loaded.get("breach_at")
             state["last_updated"] = loaded.get("last_updated")
 
-        self._expire_if_needed(asset, state, persist=False)
+        self._expire_if_needed(asset, window, state, persist=False)
         with self._lock:
-            self._state[asset] = state
+            self._state[key] = state
         return dict(state)
 
-    def _persist_state(self, asset: str, state: Dict[str, Any]) -> None:
-        asset = asset.lower()
+    def _persist_state(self, asset: str, window: str, state: Dict[str, Any]) -> None:
+        key = _cooldown_state_key(asset, window)
         payload = {
             "window_pnl":        round(float(state.get("window_pnl", 0.0)), 4),
             "disabled_until_ts": state.get("disabled_until_ts"),
@@ -596,9 +612,9 @@ class AssetCooldownManager:
         }
         state["last_updated"] = payload["last_updated"]
         if _redis_available:
-            redis_set_json(_cooldown_redis_key(asset), payload)
+            redis_set_json(_cooldown_redis_key(asset, window), payload)
         try:
-            path = _cooldown_local_path(asset)
+            path = _cooldown_local_path(asset, window)
             tmp  = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
@@ -606,10 +622,10 @@ class AssetCooldownManager:
                 os.fsync(f.fileno())
             os.replace(tmp, path)
         except Exception as e:
-            print(f"⚠️ [COOLDOWN] Local persist failed for {asset.upper()} (non-fatal): {e}")
+            print(f"⚠️ [COOLDOWN] Local persist failed for {key} (non-fatal): {e}")
 
     def _expire_if_needed(
-        self, asset: str, state: Dict[str, Any], *, persist: bool = True,
+        self, asset: str, window: str, state: Dict[str, Any], *, persist: bool = True,
     ) -> bool:
         """If cooldown has expired, reset window_pnl and re-enable trading."""
         dut = state.get("disabled_until_ts")
@@ -619,12 +635,13 @@ class AssetCooldownManager:
         if now < float(dut):
             return False
 
-        asset_up = asset.upper()
-        print(f"[COOLDOWN] {asset_up} cooldown expired")
-        print(f"[COOLDOWN] {asset_up} trading re-enabled")
+        label = f"{asset.upper()} {window}"
+        print(f"[COOLDOWN] {label} cooldown expired")
+        print(f"[COOLDOWN] {label} trading re-enabled")
         exec_log(
             "cooldown_expired",
             asset=asset,
+            window=window,
             previous_window_pnl=state.get("window_pnl"),
         )
 
@@ -632,30 +649,28 @@ class AssetCooldownManager:
         state["disabled_until_ts"] = None
         state["breach_at"]         = None
         if persist:
-            self._persist_state(asset, state)
+            self._persist_state(asset, window, state)
         return True
 
-    def record_realized_pnl(self, asset: str, pnl_amount: float) -> None:
+    def record_realized_pnl(self, asset: str, window: str, pnl_amount: float) -> None:
         """Add realized PnL to the cooldown window; trigger cooldown on breach."""
         if not _is_finite_number(pnl_amount):
             return
 
-        asset = asset.lower()
+        key = _cooldown_state_key(asset, window)
         with self._lock:
-            state = self._load_state(asset)
-            self._expire_if_needed(asset, state)
+            state = self._load_state(asset, window)
+            self._expire_if_needed(asset, window, state)
 
             if state.get("disabled_until_ts") is not None:
-                # Already in cooldown — do not extend the window counter; exits
-                # during cooldown are handled by TP/SL but start fresh after expiry.
-                self._state[asset] = state
+                self._state[key] = state
                 return
 
             state["window_pnl"] = round(state["window_pnl"] + float(pnl_amount), 4)
-            self._state[asset]  = state
+            self._state[key]  = state
 
             if state["window_pnl"] > -ASSET_MAX_CUMULATIVE_LOSS:
-                self._persist_state(asset, state)
+                self._persist_state(asset, window, state)
                 return
 
             until_ts = t.time() + ASSET_COOLDOWN_SECONDS
@@ -664,42 +679,43 @@ class AssetCooldownManager:
 
             state["disabled_until_ts"] = until_ts
             state["breach_at"]         = until_str
-            self._state[asset]         = state
-            self._persist_state(asset, state)
+            self._state[key]         = state
+            self._persist_state(asset, window, state)
 
-        asset_up = asset.upper()
+        label = f"{asset.upper()} {window}"
         print(
-            f"[COOLDOWN] {asset_up} cumulative PnL reached "
+            f"[COOLDOWN] {label} cumulative PnL reached "
             f"-${abs(state['window_pnl']):.2f}"
         )
-        print(f"[COOLDOWN] {asset_up} trading disabled until {until_str} UTC")
+        print(f"[COOLDOWN] {label} trading disabled until {until_str} UTC")
         exec_log(
             "cooldown_triggered",
             asset=asset,
+            window=window,
             window_pnl=state["window_pnl"],
             disabled_until_utc=until_str,
             max_loss=ASSET_MAX_CUMULATIVE_LOSS,
             cooldown_minutes=ASSET_COOLDOWN_MINUTES,
         )
 
-    def is_entry_blocked(self, asset: str) -> bool:
-        """Return True when new entries must be blocked for this asset."""
-        asset = asset.lower()
+    def is_entry_blocked(self, asset: str, window: str) -> bool:
+        """Return True when new entries must be blocked for this worker."""
+        key = _cooldown_state_key(asset, window)
         with self._lock:
-            state = self._load_state(asset)
-            expired = self._expire_if_needed(asset, state)
+            state = self._load_state(asset, window)
+            expired = self._expire_if_needed(asset, window, state)
             if expired:
-                self._state[asset] = state
+                self._state[key] = state
             blocked = state.get("disabled_until_ts") is not None
-            self._state[asset] = state
+            self._state[key] = state
             return blocked
 
-    def get_status(self, asset: str) -> Dict[str, Any]:
-        asset = asset.lower()
+    def get_status(self, asset: str, window: str) -> Dict[str, Any]:
+        key = _cooldown_state_key(asset, window)
         with self._lock:
-            state = self._load_state(asset)
-            self._expire_if_needed(asset, state)
-            self._state[asset] = state
+            state = self._load_state(asset, window)
+            self._expire_if_needed(asset, window, state)
+            self._state[key] = state
 
         dut = state.get("disabled_until_ts")
         now = t.time()
@@ -722,7 +738,7 @@ class AssetCooldownManager:
         }
 
     def get_all_statuses(self) -> Dict[str, Dict[str, Any]]:
-        return {a: self.get_status(a) for a in TRADING_ASSETS}
+        return {wc.key: self.get_status(wc.asset, wc.window) for wc in WORKER_CONFIGS}
 
 
 asset_cooldown = AssetCooldownManager()
@@ -1013,17 +1029,21 @@ def _parse_ts(ts_str: str) -> Optional[int]:
         return None
 
 
-def _load_trades_for_asset(asset: str) -> List[Dict]:
+def _load_trades_for_asset(asset: str, window: str = "5m") -> List[Dict]:
     """
-    Return the full trade list for one asset from Redis (primary) or the
-    local JSON fallback.  Each item must have 'timestamp' and 'cumulative_pnl'.
+    Return the full trade list for one worker from Redis (primary) or local JSON.
+    Falls back to legacy per-asset keys when window-scoped data is absent.
     """
+    redis_key = f"emiliano:{asset.lower()}:{window.lower()}:trades"
     if _redis_available:
-        trades = redis_get_json(f"emiliano:{asset}:trades")
+        trades = redis_get_json(redis_key)
         if trades and isinstance(trades, list) and len(trades) > 0:
             return trades
-    # Local JSON fallback
-    fp = f"{asset}_pnl_history.json"
+        legacy = redis_get_json(f"emiliano:{asset.lower()}:trades")
+        if legacy and isinstance(legacy, list) and len(legacy) > 0:
+            return legacy
+
+    fp = asset_pnl_filename(asset, window)
     try:
         if os.path.exists(fp):
             with open(fp, "r", encoding="utf-8") as f:
@@ -1033,6 +1053,17 @@ def _load_trades_for_asset(asset: str) -> List[Dict]:
                 return trades
     except Exception as e:
         print(f"⚠️ [backfill] Could not read {fp}: {e}")
+
+    legacy_fp = f"{asset.lower()}_pnl_history.json"
+    try:
+        if os.path.exists(legacy_fp):
+            with open(legacy_fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            trades = data.get("trades", [])
+            if trades:
+                return trades
+    except Exception as e:
+        print(f"⚠️ [backfill] Could not read {legacy_fp}: {e}")
     return []
 
 
@@ -1066,7 +1097,7 @@ def _build_equity_curve(all_trades_by_asset: Dict[str, List[Dict]]) -> List[Dict
 
     events.sort(key=lambda e: e[0])
 
-    asset_pnl: Dict[str, float] = {a: 0.0 for a in TRADING_ASSETS}
+    asset_pnl: Dict[str, float] = {wc.key: 0.0 for wc in WORKER_CONFIGS}
     seen_ts: Dict[int, float]   = {}
 
     for ts_ms, asset, cum_pnl in events:
@@ -1106,10 +1137,10 @@ def portfolio_history_backfill() -> int:
     # Step 1: load all trade records
     all_trades: Dict[str, List[Dict]] = {}
     total_trade_count = 0
-    for asset in TRADING_ASSETS:
-        trades = _load_trades_for_asset(asset)
-        all_trades[asset] = trades
-        print(f"  [{asset.upper()}] {len(trades)} trade records found")
+    for wc in WORKER_CONFIGS:
+        trades = _load_trades_for_asset(wc.asset, wc.window)
+        all_trades[wc.key] = trades
+        print(f"  [{wc.asset.upper()} {wc.window}] {len(trades)} trade records found")
         total_trade_count += len(trades)
 
     if total_trade_count == 0:
@@ -1627,8 +1658,8 @@ def get_trade_history(limit: int = 10) -> List[Dict]:
     return [_normalize_history_record(r) for r in sorted_recs[: max(1, limit)]]
 
 
-def _synthesize_history_from_pnl_trade(trade: Dict, asset: str) -> List[Dict]:
-    """Build BUY (+ optional SELL) rows from one emiliano:{asset}:trades entry."""
+def _synthesize_history_from_pnl_trade(trade: Dict, asset: str, window: str = "5m") -> List[Dict]:
+    """Build BUY (+ optional SELL) rows from one emiliano:{asset}:{window}:trades entry."""
     out: List[Dict] = []
     details = trade.get("details") or {}
     side    = details.get("side") or details.get("bought_side") or trade.get("side")
@@ -1639,7 +1670,7 @@ def _synthesize_history_from_pnl_trade(trade: Dict, asset: str) -> List[Dict]:
     market  = trade.get("market") or f"{asset.upper()} Up or Down"
     ts_str  = trade.get("timestamp") or ""
     ts_ms   = _parse_ts(ts_str) or int(t.time() * 1000)
-    size    = float(details.get("size") or details.get("shares") or POSITION_SIZE)
+    size    = float(details.get("size") or details.get("shares") or MIN_SHARES)
 
     entry_price_raw = details.get("entry_price")
     entry_price = None
@@ -1650,7 +1681,7 @@ def _synthesize_history_from_pnl_trade(trade: Dict, asset: str) -> List[Dict]:
 
     if entry_price and entry_price > 0:
         out.append({
-            "asset": asset.upper(), "slug": slug, "market": market,
+            "asset": asset.upper(), "window": window, "slug": slug, "market": market,
             "action": "buy", "side": str(side).upper(),
             "price": entry_price, "size": size,
             "timestamp": ts_str, "timestamp_ms": max(1, ts_ms - 1000),
@@ -1668,7 +1699,7 @@ def _synthesize_history_from_pnl_trade(trade: Dict, asset: str) -> List[Dict]:
         "TAKE_PROFIT", "STOP_LOSS", "MANUAL_CASHOUT",
     ):
         out.append({
-            "asset": asset.upper(), "slug": slug, "market": market,
+            "asset": asset.upper(), "window": window, "slug": slug, "market": market,
             "action": "sell", "side": str(side).upper(),
             "price": max(exit_price, 0.0), "size": size,
             "timestamp": ts_str, "timestamp_ms": ts_ms,
@@ -1678,7 +1709,7 @@ def _synthesize_history_from_pnl_trade(trade: Dict, asset: str) -> List[Dict]:
         won = market_outcome and str(market_outcome).upper() == str(side).upper()
         settle = 1.0 if won else 0.0
         out.append({
-            "asset": asset.upper(), "slug": slug, "market": market,
+            "asset": asset.upper(), "window": window, "slug": slug, "market": market,
             "action": "redeem", "side": str(side).upper(),
             "price": settle, "size": size,
             "timestamp": ts_str, "timestamp_ms": ts_ms,
@@ -1697,9 +1728,9 @@ def trade_history_backfill() -> int:
 
     print("🔄 [trade-history] Inspecting existing trade records for backfill...")
     synthesized: List[Dict] = []
-    for asset in TRADING_ASSETS:
-        for trade in _load_trades_for_asset(asset):
-            synthesized.extend(_synthesize_history_from_pnl_trade(trade, asset))
+    for wc in WORKER_CONFIGS:
+        for trade in _load_trades_for_asset(wc.asset, wc.window):
+            synthesized.extend(_synthesize_history_from_pnl_trade(trade, wc.asset, wc.window))
 
     if not synthesized:
         print("ℹ️  [trade-history] No trade records to backfill from.")
@@ -1736,11 +1767,23 @@ def collect_open_positions(workers: List["MarketWorker"]) -> List[Dict]:
     return out
 
 
+def find_worker(
+    workers: List["MarketWorker"], asset: str, window: str,
+) -> Optional["MarketWorker"]:
+    a = asset.strip().lower()
+    w = window.strip().lower()
+    for worker in workers:
+        if worker.asset_type == a and worker.window_slug == w:
+            return worker
+    return None
+
+
 def find_worker_by_asset(workers: List["MarketWorker"], asset: str) -> Optional["MarketWorker"]:
+    """Backward-compatible lookup — returns first worker matching asset."""
     key = asset.strip().lower()
-    for w in workers:
-        if w.asset_type == key:
-            return w
+    for worker in workers:
+        if worker.asset_type == key:
+            return worker
     return None
 
 
@@ -2134,11 +2177,19 @@ class AccountService:
 
     # ── Shared order execution helpers (used by every MarketWorker) ─────────
 
-    def create_and_post_order(self, side_str: str, price: float, size: float, token_id: str):
+    def create_and_post_order(
+        self,
+        side_str: str,
+        price: float,
+        size: float,
+        token_id: str,
+        order_type: str = "GTC",
+    ):
         """Build + submit an order through the single shared ClobClient."""
         order_args   = OrderArgs(price=price, size=size, side=side_str, token_id=token_id)
         signed_order = self.client.create_order(order_args)
-        resp         = self.client.post_order(signed_order, cast(OrderType, OrderType.GTC))
+        ot = parse_order_type(order_type)
+        resp         = self.client.post_order(signed_order, cast(OrderType, ot))
         return resp
 
     def get_order_status(self, order_id: str):
@@ -2195,37 +2246,35 @@ class AccountService:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class MarketWorker:
-    def __init__(self, asset_type: str, account: "AccountService"):
-        # Shared, single-instance account/wallet service — injected, not created.
+    def __init__(self, worker_config: WorkerConfig, account: "AccountService"):
+        self.worker_config = worker_config
         self.account = account
 
-        # Convenience references so existing per-asset logic that reads
-        # self.w3 / self.client / self.wallet_address keeps working unchanged,
-        # while the underlying objects are still owned (singly) by AccountService.
         self.w3             = account.w3
         self.client         = account.client
         self.wallet_address = account.wallet_address
         self.signer_address = account.signer_address
         self.private_key    = account.private_key
 
-        self.asset_type    = asset_type.lower()
+        self.asset_type    = worker_config.asset.lower()
+        self.window_slug   = worker_config.window
         self.active_market: Optional[Dict[str, Any]] = None
         self.prices: Dict[str, float] = {"YES": 0.0, "NO": 0.0}
+        self.bids: Dict[str, float] = {"YES": 0.0, "NO": 0.0}
         self.transitioning = False
 
         self.session_profit = 0.0
         self.trade_count    = 0
 
-        _saved              = self._load_pnl_stats(asset_type.lower())
+        _saved              = self._load_pnl_stats(self.asset_type, self.window_slug)
         self.cumulative_pnl: float = _saved["total_pnl"]
         self.wins: int             = _saved["wins"]
         self.losses: int           = _saved["losses"]
 
-        # Single-leg position tracking
         self.trade_state: TradeState = TradeState.IDLE
-        self.position_side: Optional[str] = None   # "YES" or "NO"
-        self.position_size: float = 0.0            # shares held
-        self.entry_price:   float = 0.0            # actual fill price
+        self.position_side: Optional[str] = None
+        self.position_size: float = 0.0
+        self.entry_price:   float = 0.0
 
         self.exited            = False
         self.processed_markets = set()
@@ -2233,7 +2282,7 @@ class MarketWorker:
         self.start_delay_met   = False
         self.market_start_time: Optional[float] = None
 
-        self.dummy_balance  = POSITION_SIZE
+        self.dummy_balance  = float(worker_config.momentum_size)
         self.last_trade_time = 0
         self.logged_markets  = set()
 
@@ -2241,7 +2290,7 @@ class MarketWorker:
         self.last_no_update  = 0.0
 
         self.price_history: deque = deque(maxlen=30)
-        self.binance: Optional[BinanceDepthSignal] = None
+        self.binance = None
 
         self.market_outcome  = None
         self.final_yes_price = 0.0
@@ -2251,12 +2300,12 @@ class MarketWorker:
         self.seen_markets = set()
 
         self.market_exit_reasons: Dict[str, str] = {}
-
-        # Single-flight lock — prevents duplicate orders on the same tick.
         self._order_lock = asyncio.Lock()
 
+        label = f"{self.asset_type.upper()} {self.window_slug}"
         self.dashboard = {
-            "asset":              asset_type.upper(),
+            "asset":              self.asset_type.upper(),
+            "window":             self.window_slug,
             "yes":                0,
             "no":                 0,
             "timer":              "--:--",
@@ -2266,25 +2315,22 @@ class MarketWorker:
             "entry_price":        0.0,
             "outcome":            "PENDING",
             "profit":             0.0,
-            "imbalance_ratio":    0.0,
-            "imbalance_momentum": 0.0,
+            "price_delta":        0.0,
+            "signal_stale":       True,
+            "execution_mode":     worker_config.execution_mode,
+            "strategy":           worker_config.strategy,
         }
         self.recent_logs: Deque[str] = deque(maxlen=4)
 
-        # Last market slug for which a trade has been logged. Used by
-        # log_pnl() as a per-round dedup guard so a retried exit handler
-        # cannot double-log (and double-snapshot) the same market round.
         self._last_logged_slug: Optional[str] = None
-
-        # Manual dashboard cashout guard — prevents duplicate UI-triggered exits.
         self._cashout_in_progress: bool = False
-
-        # History action for the next exit log_trade call (sell vs redeem).
         self._history_exit_action: str = "sell"
 
-        # Register with the process-wide worker registry so
-        # _portfolio_total_pnl() can sum every asset's PnL when computing
-        # the cross-asset portfolio total for the equity chart.
+        if worker_config.strategy == "legacy":
+            self.strategy = LegacyStrategy()
+        else:
+            self.strategy = MomentumStrategy()
+
         _register_worker(self)
 
     # ═════════════════════════════════════════════════════════════════════
@@ -2293,17 +2339,18 @@ class MarketWorker:
     # ═════════════════════════════════════════════════════════════════════
 
     def _redis_stats_key(self) -> str:
-        return f"emiliano:{self.asset_type}:stats"
+        return f"emiliano:{self.asset_type}:{self.window_slug}:stats"
 
     def _redis_trades_key(self) -> str:
-        return f"emiliano:{self.asset_type}:trades"
+        return f"emiliano:{self.asset_type}:{self.window_slug}:trades"
 
     @staticmethod
-    def _load_pnl_stats(asset_type: str) -> dict:
+    def _load_pnl_stats(asset_type: str, window: str) -> dict:
+        redis_key = f"emiliano:{asset_type}:{window}:stats"
         if _redis_available:
-            data = redis_get_json(f"emiliano:{asset_type}:stats")
+            data = redis_get_json(redis_key)
             if data:
-                print(f"✅ [{asset_type.upper()}] Loaded PnL stats from Redis: "
+                print(f"✅ [{asset_type.upper()} {window}] Loaded PnL stats from Redis: "
                       f"PnL=${data.get('total_pnl', 0):.2f} "
                       f"W{data.get('wins', 0)}/L{data.get('losses', 0)}")
                 return {
@@ -2311,8 +2358,16 @@ class MarketWorker:
                     "wins":      int(data.get("wins", 0)),
                     "losses":    int(data.get("losses", 0)),
                 }
+            legacy = redis_get_json(f"emiliano:{asset_type}:stats")
+            if legacy:
+                print(f"✅ [{asset_type.upper()} {window}] Loaded legacy PnL stats from Redis")
+                return {
+                    "total_pnl": float(legacy.get("total_pnl", 0.0)),
+                    "wins":      int(legacy.get("wins", 0)),
+                    "losses":    int(legacy.get("losses", 0)),
+                }
 
-        file_path = f"{asset_type}_pnl_history.json"
+        file_path = asset_pnl_filename(asset_type, window)
         try:
             if os.path.exists(file_path):
                 with open(file_path, "r") as f:
@@ -2323,9 +2378,22 @@ class MarketWorker:
                     "losses":    int(data.get("losses", 0)),
                 }
                 if _redis_available:
-                    print(f"📤 [{asset_type.upper()}] Migrating local stats → Redis...")
-                    redis_set_json(f"emiliano:{asset_type}:stats", result)
+                    print(f"📤 [{asset_type.upper()} {window}] Migrating local stats → Redis...")
+                    redis_set_json(redis_key, result)
                 return result
+        except Exception:
+            pass
+
+        legacy_path = f"{asset_type}_pnl_history.json"
+        try:
+            if os.path.exists(legacy_path):
+                with open(legacy_path, "r") as f:
+                    data = json.load(f)
+                return {
+                    "total_pnl": float(data.get("total_pnl", 0.0)),
+                    "wins":      int(data.get("wins", 0)),
+                    "losses":    int(data.get("losses", 0)),
+                }
         except Exception:
             pass
 
@@ -2378,11 +2446,35 @@ class MarketWorker:
         now          = datetime.now(timezone.utc)
         remaining    = self.active_market["expiry"] - now
         seconds_left = int(remaining.total_seconds())
-        if seconds_left <= LISTENER_ACTIVATE_SECONDS:
+        activate = self.worker_config.listener_activate_secs
+        if seconds_left <= activate:
             return "00:00"
-        wait_seconds = seconds_left - LISTENER_ACTIVATE_SECONDS
+        wait_seconds = seconds_left - activate
         mins, secs   = divmod(wait_seconds, 60)
         return f"{mins:02d}:{secs:02d}"
+
+    def is_dry_run(self) -> bool:
+        return self.worker_config.dry_run
+
+    def order_size_shares(self) -> Optional[int]:
+        size = min(self.worker_config.momentum_size, self.worker_config.max_buy_order_size)
+        if size < MIN_SHARES:
+            return None
+        return size
+
+    def update_momentum_dashboard(self, signal, delta: Optional[float]) -> None:
+        self.dashboard["price_delta"] = round(float(delta or 0.0) * 100, 4)
+        self.dashboard["signal_stale"] = signal.is_stale
+        if signal.is_stale:
+            self.dashboard["momentum_signal"] = "STALE"
+        elif delta is None:
+            self.dashboard["momentum_signal"] = "WARMING UP"
+        elif delta >= self.worker_config.entry_min_delta:
+            self.dashboard["momentum_signal"] = f"BULL ↑ {self.dashboard['price_delta']:+.3f}%"
+        elif delta <= -self.worker_config.entry_min_delta:
+            self.dashboard["momentum_signal"] = f"BEAR ↓ {self.dashboard['price_delta']:+.3f}%"
+        else:
+            self.dashboard["momentum_signal"] = "NEUTRAL"
 
     def get_current_pnl(self) -> Tuple[float, float, str]:
         if not self.position_side or self.entry_price <= 0:
@@ -2405,7 +2497,7 @@ class MarketWorker:
 
     def log_trade(self, side: str, price: float, action: str = "BUY",
                   size: float = 0.0, order_id: Optional[str] = None):
-        mode_label  = "[DRY]" if DRY_MODE else "[LIVE]"
+        mode_label  = "[DRY]" if self.is_dry_run() else "[LIVE]"
         market_name = self.active_market['question'] if self.active_market else "Unknown Market"
         slug        = ((self.active_market.get("slug") if self.active_market else None)
                        or self.market_slug or self.asset_type)
@@ -2416,10 +2508,12 @@ class MarketWorker:
         exec_log(
             "trade", mode=mode_label, action=action, side=side,
             price=price, size=size, order_id=order_id, market=market_name,
+            window=self.window_slug,
         )
         if size > 0 and price > 0 and side in ("YES", "NO"):
             append_trade_history({
                 "asset":    self.asset_type.upper(),
+                "window":   self.window_slug,
                 "market":   market_name,
                 "slug":     slug,
                 "action":   action,
@@ -2473,17 +2567,18 @@ class MarketWorker:
     async def price_listener(self):
         if not self.active_market:
             return
+        activate = self.worker_config.listener_activate_secs
         while True:
             now          = datetime.now(timezone.utc)
             remaining    = self.active_market["expiry"] - now
             seconds_left = int(remaining.total_seconds())
-            if seconds_left <= LISTENER_ACTIVATE_SECONDS:
+            if seconds_left <= activate:
                 break
-            sleep_time = min(5, seconds_left - LISTENER_ACTIVATE_SECONDS)
+            sleep_time = min(5, seconds_left - activate)
             print(f"⏳ Waiting for WS window: {seconds_left}s left...", end="\r")
             await asyncio.sleep(max(1, sleep_time))
 
-        print(f"\n\n📡 Starting WebSocket listener in final {LISTENER_ACTIVATE_SECONDS}s window...")
+        print(f"\n\n📡 Starting WebSocket listener in final {activate}s window...")
 
         async for ws in websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, close_timeout=10):
             try:
@@ -2494,9 +2589,6 @@ class MarketWorker:
                 }
                 await ws.send(json.dumps(sub_msg))
                 print(f"\n📡 Subscription active for: {self.active_market['question']}")
-                if self.binance is None:
-                    sym          = binance_futures_symbol(self.asset_type)
-                    self.binance = await BinanceDepthSignal.get_or_create(sym)
 
                 async for message in ws:
                     if self.exited:
@@ -2521,19 +2613,33 @@ class MarketWorker:
                         if e_type in ["book", "initial_state"]:
                             for asset in ev.get("assets", []):
                                 aid = asset.get("asset_id")
-                                p   = float(asset.get("best_ask", 0))
+                                ask = float(asset.get("best_ask", 0))
+                                bid = float(asset.get("best_bid", 0))
                                 if aid == self.active_market["yes_id"]:
-                                    self.prices["YES"] = p
+                                    if ask > 0:
+                                        self.prices["YES"] = ask
+                                    if bid > 0:
+                                        self.bids["YES"] = bid
                                 elif aid == self.active_market["no_id"]:
-                                    self.prices["NO"] = p
+                                    if ask > 0:
+                                        self.prices["NO"] = ask
+                                    if bid > 0:
+                                        self.bids["NO"] = bid
                         elif e_type == "price_change":
                             for change in ev.get("price_changes", []):
                                 aid = change.get("asset_id")
-                                p   = float(change.get("best_ask") or change.get("price", 0))
+                                ask = float(change.get("best_ask") or change.get("price", 0))
+                                bid = float(change.get("best_bid", 0))
                                 if aid == self.active_market["yes_id"]:
-                                    self.prices["YES"] = p
+                                    if ask > 0:
+                                        self.prices["YES"] = ask
+                                    if bid > 0:
+                                        self.bids["YES"] = bid
                                 elif aid == self.active_market["no_id"]:
-                                    self.prices["NO"] = p
+                                    if ask > 0:
+                                        self.prices["NO"] = ask
+                                    if bid > 0:
+                                        self.bids["NO"] = bid
                     if self.prices["YES"] > 0 and self.prices["NO"] > 0:
                         self.price_history.append({
                             "ts":  t.time(),
@@ -2556,31 +2662,11 @@ class MarketWorker:
     # ═════════════════════════════════════════════════════════════════════
 
     async def check_logic(self, timer: str):
-        """
-        Single-leg entry logic. Called on every WebSocket price tick.
-
-        Entry conditions (ALL must be true):
-          1. trade_state == IDLE  (no position already open)
-          2. price >= MIN_ENTRY_PRICE  (>= 90c)
-          3. not is_locked_price(price)  (not exactly 1c or 100c)
-          4. _order_lock is not held  (no concurrent order in flight)
-
-        YES is evaluated first. If YES qualifies, it is purchased and the
-        function returns — NO is never evaluated in the same tick.
-        If YES does not qualify, NO is evaluated under the same conditions.
-
-        Once FILLED, check_logic only runs TP/SL evaluation via
-        _check_single_side_exit(). No second entry is ever attempted.
-        """
+        """Strategy-driven entry; TP/SL when FILLED."""
         y = self.prices.get("YES", 0.0)
         n = self.prices.get("NO",  0.0)
         if y <= 0 or n <= 0:
             return
-
-        imbalance = self.binance.imbalance if (self.binance and self.binance.is_fresh) else 0.0
-        momentum  = self.binance.momentum  if (self.binance and self.binance.is_fresh) else 0.0
-        self.dashboard["imbalance_ratio"]    = imbalance
-        self.dashboard["imbalance_momentum"] = momentum
 
         y_c = round(y * 100)
         n_c = round(n * 100)
@@ -2589,77 +2675,44 @@ class MarketWorker:
         self.dashboard["timer"] = timer
         self.update_dashboard()
 
-        # Position is open — only monitor TP/SL, never enter a new trade.
         if self.trade_state == TradeState.FILLED:
             await self._check_single_side_exit(self.position_side)
             return
 
-        # Exit/error states — nothing to do until reset.
         if self.trade_state in (TradeState.EXITING, TradeState.CLOSED, TradeState.ERROR):
             return
 
-        # Suppress re-entrant tick processing when an order is already in flight.
         if self._order_lock.locked():
-            print(f"⏳ Order in flight — skipping check_logic tick")
             return
 
-        # ── TRADING SCHEDULE GATE ────────────────────────────────────────
-        # The single, centralized weekday check. If today is Saturday or
-        # Sunday (or any day not in TRADING_DAYS), block all new entries
-        # here and return immediately. This is the ONLY place in the entire
-        # codebase where the trading-schedule restriction is enforced.
-        #
-        # What continues to run on weekends / non-trading days:
-        #   • The price listener stays connected (WS subscription active)
-        #   • TP/SL monitoring: if self.trade_state == FILLED the exit branch
-        #     above already returned before reaching this point, so open
-        #     positions are still protected. The gate below only applies to
-        #     the IDLE → FILLED transition (new entries).
-        #   • Portfolio chart updates, Redis writes, PnL merges, heartbeat
-        #     keep running in main.py independently of this gate.
-        #
-        # The moment Monday arrives (in TRADING_TZ) is_trading_allowed()
-        # returns True again automatically — no restart required.
         if not is_trading_allowed():
             log_weekend_block(self.asset_type, "YES/NO", round(max(y, n) * 100))
             return
 
-        # ── ASSET COOLDOWN GATE ─────────────────────────────────────────
-        # Blocks new entries when this asset's cooldown-window realized PnL
-        # has breached -ASSET_MAX_CUMULATIVE_LOSS. Independent per asset.
-        # TP/SL on existing positions already returned above when FILLED.
-        if asset_cooldown.is_entry_blocked(self.asset_type):
-            log_cooldown_block(self.asset_type, "YES/NO", round(max(y, n) * 100))
+        if asset_cooldown.is_entry_blocked(self.asset_type, self.window_slug):
+            log_cooldown_block(self.asset_type, self.window_slug, "YES/NO", round(max(y, n) * 100))
             return
 
-        # ── IDLE: look for first qualifying side ─────────────────────────
+        decision = await self.strategy.evaluate(self)
+        if decision:
+            delta_str = f" delta={decision.delta*100:.3f}%" if decision.delta is not None else ""
+            print(f"[ENTRY] {self.asset_type.upper()} {self.window_slug} | "
+                  f"{decision.side} @ {round(decision.price*100)}c | "
+                  f"mode={decision.execution_mode} size={decision.size}{delta_str}")
+            self.log_to_file(
+                f"[ENTRY] {decision.side} @ {round(decision.price*100)}c "
+                f"mode={decision.execution_mode} size={decision.size}{delta_str}"
+            )
+            async with self._order_lock:
+                if self.trade_state != TradeState.IDLE:
+                    return
+                await self.strategy.execute(self, decision)
+            return
 
-        # Evaluate YES first.
-        if y >= MIN_ENTRY_PRICE:
-            if is_locked_price(y):
-                print(f"🔒 [SKIP] YES @ {y_c}c is a locked price (1c or 100c) — skipping entry.")
-                self.add_log(f"🔒 YES locked @ {y_c}c — skip")
-            else:
-                print(f"[ENTRY] YES @ {y_c}c >= {round(MIN_ENTRY_PRICE*100)}c threshold — buying YES")
-                self.log_to_file(f"[ENTRY] YES @ {y_c}c >= threshold {round(MIN_ENTRY_PRICE*100)}c")
-                await self.execute_order("YES", y, Side.BUY)
-                return  # re-evaluate next tick after state update
-
-        # YES did not qualify — evaluate NO.
-        if n >= MIN_ENTRY_PRICE:
-            if is_locked_price(n):
-                print(f"🔒 [SKIP] NO @ {n_c}c is a locked price (1c or 100c) — skipping entry.")
-                self.add_log(f"🔒 NO locked @ {n_c}c — skip")
-            else:
-                print(f"[ENTRY] NO @ {n_c}c >= {round(MIN_ENTRY_PRICE*100)}c threshold — buying NO")
-                self.log_to_file(f"[ENTRY] NO @ {n_c}c >= threshold {round(MIN_ENTRY_PRICE*100)}c")
-                await self.execute_order("NO", n, Side.BUY)
-                return
-
-        # Neither side qualifies yet.
-        print(f"⏳ [IDLE] YES={y_c}c | NO={n_c}c | "
-              f"need >={round(MIN_ENTRY_PRICE*100)}c | "
-              f"Binance: {self.binance.signal_label if self.binance else 'N/A'}")
+        if self.worker_config.strategy == "momentum":
+            sig = self.dashboard.get("momentum_signal", "NEUTRAL")
+            print(f"⏳ [IDLE] {self.asset_type.upper()} {self.window_slug} | "
+                  f"YES={y_c}c NO={n_c}c | Binance: {sig}")
 
     async def _check_single_side_exit(self, side: Optional[str]) -> bool:
         """
@@ -2674,14 +2727,139 @@ class MarketWorker:
             return False
 
         loss_pct = (entry_price - current_price) / entry_price
-        if loss_pct >= STOP_LOSS_PCT / 100:
+        if loss_pct >= self.worker_config.stop_loss_pct / 100:
             print(f"\n\n⚠️ STOP LOSS TRIGGERED: {side} -{loss_pct*100:.1f}%")
             await self.market_exit(loss_pct, is_profit=False)
+            return True
+
+        gain_pct = (current_price - entry_price) / entry_price
+        if gain_pct >= self.worker_config.take_profit_pct / 100:
+            print(f"\n\n💰 TAKE PROFIT TRIGGERED: {side} +{gain_pct*100:.1f}%")
+            await self.market_exit(gain_pct, is_profit=True)
             return True
 
         return False
 
     # ── Order execution ────────────────────────────────────────────────
+
+    async def place_order_raw(
+        self,
+        side: str,
+        price: float,
+        size: int,
+        *,
+        order_type: str = "GTC",
+    ) -> Tuple[bool, Optional[str], bool]:
+        """Submit one order; return (accepted, order_id, filled_immediately)."""
+        if not self.active_market:
+            return False, None, False
+
+        token_id = (self.active_market["yes_id"] if side == "YES"
+                    else self.active_market["no_id"])
+        clean_price = max(0.01, min(0.99, round(price, 2)))
+
+        if self.is_dry_run():
+            print(f"\n🧪 [DRY] BUY {size} {side} @ {round(clean_price*100)}c "
+                  f"mode={order_type}")
+            exec_log("dry_run_order", side=side, price=clean_price, size=size,
+                     order_type=order_type, window=self.window_slug)
+            return True, "dry-run", True
+
+        try:
+            resp = self.account.create_and_post_order(
+                "BUY", clean_price, float(size), token_id, order_type=order_type,
+            )
+        except Exception as e:
+            exec_log("order_failed", side=side, error=str(e), order_type=order_type)
+            print(f"❌ Order placement failed: {e}")
+            return False, None, False
+
+        order_id = None
+        if isinstance(resp, dict):
+            order_id = resp.get("orderID") or resp.get("order_id")
+        elif isinstance(resp, str):
+            try:
+                parsed = json.loads(resp)
+                order_id = parsed.get("orderID") or parsed.get("order_id")
+            except Exception:
+                pass
+
+        filled = False
+        if order_type.upper() == "FOK" and order_id:
+            await asyncio.sleep(0.5)
+            try:
+                info = self.account.get_order_status(order_id)
+                if isinstance(info, str):
+                    info = json.loads(info)
+                if isinstance(info, dict):
+                    st = str(info.get("status", "")).lower()
+                    filled = st in ("filled", "matched", "closed")
+            except Exception:
+                pass
+
+        exec_log("order_submit", side=side, price=clean_price, size=size,
+                 order_type=order_type, order_id=order_id, filled=filled)
+        return True, order_id, filled
+
+    async def execute_momentum_order(
+        self,
+        side: str,
+        price: float,
+        direction: Side,
+        *,
+        size: int,
+        order_type: str = "GTC",
+        wait_for_fill: bool = True,
+        fok_timeout_sec: float = 3.0,
+        use_price_as_is: bool = False,
+    ) -> bool:
+        if not self.active_market:
+            return False
+        if direction != Side.BUY:
+            await self.execute_order(side, price, direction)
+            return self.trade_state == TradeState.FILLED
+
+        if self.trade_state != TradeState.IDLE:
+            return False
+        if asset_cooldown.is_entry_blocked(self.asset_type, self.window_slug):
+            return False
+        if is_locked_price(price):
+            return False
+        if price > MAX_BUY_PRICE:
+            return False
+        if size < MIN_SHARES:
+            print(f"⚠️ [SKIP] Order size {size} below minimum {MIN_SHARES} shares")
+            return False
+
+        submit_price = price if use_price_as_is else clamp_buy_price(price)
+
+        if self.is_dry_run():
+            print(f"\n🧪 [DRY] {order_type} BUY {size} {side} @ {round(submit_price*100)}c")
+            self.update_state(side, submit_price, direction, float(size))
+            return True
+
+        if order_type.upper() == "FOK" and wait_for_fill:
+            ok, order_id, filled = await self.place_order_raw(
+                side, submit_price, size, order_type="FOK",
+            )
+            if ok and filled:
+                self.update_state(side, submit_price, direction, float(size))
+                return True
+            if order_id and order_id != "dry-run":
+                self._try_cancel_order(order_id)
+            return False
+
+        timeout = fok_timeout_sec if order_type.upper() == "FOK" else FILL_TIMEOUT_SEC
+        success, actual_size = await self.confirmed_execute(
+            side,
+            submit_price if use_price_as_is else price,
+            direction,
+            timeout_sec=timeout,
+            requested_size=float(size),
+            order_type=order_type,
+            use_price_as_is=use_price_as_is,
+        )
+        return success and actual_size > 0
 
     async def execute_order(self, side: str, price: float, direction: Side):
         """
@@ -2710,16 +2888,13 @@ class MarketWorker:
             if self.trade_state != TradeState.IDLE:
                 print(f"⚠️ [ABORT] Trade state is {self.trade_state.name} — entry suppressed.")
                 return
-            if asset_cooldown.is_entry_blocked(self.asset_type):
-                print(f"🚫 [COOLDOWN] [{self.asset_type.upper()}] BUY blocked — asset in cooldown.")
+            if asset_cooldown.is_entry_blocked(self.asset_type, self.window_slug):
+                print(f"🚫 [COOLDOWN] [{self.asset_type.upper()} {self.window_slug}] BUY blocked.")
                 exec_log("execute_order_cooldown_blocked", side=side, price=price,
-                         asset=self.asset_type)
+                         asset=self.asset_type, window=self.window_slug)
                 return
-            if price < MIN_ENTRY_PRICE:
-                print(f"⚠️ [ABORT] Price {round(price*100)}c is below MIN_ENTRY_PRICE "
-                      f"({round(MIN_ENTRY_PRICE*100)}c) — skipping BUY")
-                exec_log("execute_order_below_min_entry", side=side, price=price,
-                         min_entry=MIN_ENTRY_PRICE)
+            if self.worker_config.strategy == "legacy" and price < self.worker_config.min_entry_price:
+                print(f"⚠️ [ABORT] Price {round(price*100)}c below legacy min_entry_price")
                 return
             if is_locked_price(price):
                 print(f"🔒 [ABORT] Price {round(price*100)}c is a locked price — refusing BUY.")
@@ -2735,7 +2910,7 @@ class MarketWorker:
                     else self.active_market["no_id"])
 
             if direction == Side.BUY:
-                calculated_size = POSITION_SIZE
+                calculated_size = float(self.order_size_shares() or MIN_SHARES)
             else:
                 print(f"🔍 [CHAIN] Verifying shares for {side} (ID: {t_id})...")
                 actual_balance = await self.account.get_onchain_share_balance_async(t_id)
@@ -2748,13 +2923,14 @@ class MarketWorker:
                     print(f"⚠️ [DUST TRAP] Balance {calculated_size:.4f} is dust — skipping sell")
                     return
 
-            if DRY_MODE:
+            if self.is_dry_run():
                 print(f"\n🧪 [DRY] {direction} {calculated_size} {side} @ {round(price*100)}c")
                 self.update_state(side, price, direction, calculated_size)
                 return
 
             success, actual_size = await self.confirmed_execute(
-                side, price, direction, timeout_sec=FILL_TIMEOUT_SEC
+                side, price, direction, timeout_sec=FILL_TIMEOUT_SEC,
+                requested_size=calculated_size,
             )
             if success:
                 print(f"✅ execute_order complete: {direction} {side} "
@@ -2836,7 +3012,7 @@ class MarketWorker:
                 print(f"📡 SELL attempt {attempt}/{max_sell_attempts}: "
                       f"{remaining:.2f} {side} @ {price_cents}...")
 
-                if DRY_MODE:
+                if self.is_dry_run():
                     actual_size    = remaining
                     received       = actual_size * exit_price
                     total_received += received
@@ -2998,8 +3174,9 @@ class MarketWorker:
                        or f"{self.asset_type.upper()} Up or Down")
 
         return {
-            "id":                  f"{self.asset_type}:{slug}",
+            "id":                  f"{self.asset_type}:{self.window_slug}:{slug}",
             "asset":               self.asset_type.upper(),
+            "window":              self.window_slug,
             "market":              market_name,
             "slug":                slug,
             "side":                self.position_side,
@@ -3014,6 +3191,18 @@ class MarketWorker:
             "cashout_available":   not self._cashout_in_progress,
         }
 
+    def _interval_seconds(self) -> int:
+        return self.worker_config.interval_seconds
+
+    def _interval_start(self, ts: int) -> int:
+        sec = self._interval_seconds()
+        return (ts // sec) * sec
+
+    def current_interval_starts(self, now_ts: Optional[int] = None) -> Tuple[int, int]:
+        now = now_ts if now_ts is not None else int(datetime.now(timezone.utc).timestamp())
+        base = self._interval_start(now)
+        return base, base + self._interval_seconds()
+
     # ── Confirmed order execution ──────────────────────────────────────
 
     async def confirmed_execute(
@@ -3022,6 +3211,9 @@ class MarketWorker:
         price: float,
         direction: Side,
         timeout_sec: float = 15.0,
+        requested_size: Optional[float] = None,
+        order_type: str = "GTC",
+        use_price_as_is: bool = False,
     ) -> Tuple[bool, float]:
         """
         Place a limit order via the shared (account-level) V2 CLOB client and
@@ -3047,7 +3239,11 @@ class MarketWorker:
                     else self.active_market["no_id"])
 
         if direction == Side.BUY:
-            requested_size = POSITION_SIZE
+            if requested_size is not None:
+                req_size = requested_size
+            else:
+                req_size = float(self.order_size_shares() or MIN_SHARES)
+            requested_size = req_size
         else:
             print(f"🔍 [CHAIN] Verifying shares for {side} sell (ID: {token_id})...")
             current_balance = await self.account.get_onchain_share_balance_async(token_id)
@@ -3059,17 +3255,15 @@ class MarketWorker:
                 print(f"⚠️ Dust trap: only {requested_size:.4f} — skipping sell")
                 return False, 0.0
 
-        if DRY_MODE:
+        if self.is_dry_run():
             print(f"\n🧪 [DRY CONFIRMED] {direction} {requested_size:.2f} {side} @ {round(price*100)}c")
             self.update_state(side, price, direction, requested_size)
             return True, requested_size
 
-        # Slippage bump: buy slightly higher, sell slightly lower.
         if direction == Side.BUY:
-            clean_price = round(price + 0.01, 2)
+            clean_price = price if use_price_as_is else clamp_buy_price(price)
         else:
-            clean_price = round(price - 0.01, 2)
-        clean_price = max(0.01, min(0.99, clean_price))
+            clean_price = clamp_sell_price(price)
 
         order_id    = None
         order_state = OrderState.CREATED
@@ -3077,7 +3271,7 @@ class MarketWorker:
         try:
             side_str = "BUY" if direction == Side.BUY else "SELL"
             resp     = self.account.create_and_post_order(
-                side_str, clean_price, requested_size, token_id)
+                side_str, clean_price, requested_size, token_id, order_type=order_type)
             order_state = OrderState.SUBMITTED
 
             exec_log("order_submit",
@@ -3262,6 +3456,7 @@ class MarketWorker:
         self.exited            = False
         self.market_slug       = None
         self.prices            = {"YES": 0.0, "NO": 0.0}
+        self.bids              = {"YES": 0.0, "NO": 0.0}
         self.dashboard["yes"]               = 0
         self.dashboard["no"]                = 0
         self.dashboard["timer"]             = "--:--"
@@ -3271,8 +3466,8 @@ class MarketWorker:
         self.dashboard["entry_price"]       = 0.0
         self.dashboard["status"]            = "WAITING"
         self.dashboard["profit"]            = 0.0
-        self.dashboard["imbalance_ratio"]   = 0.0
-        self.dashboard["imbalance_momentum"] = 0.0
+        self.dashboard["price_delta"]       = 0.0
+        self.dashboard["signal_stale"]      = True
         self.recent_logs.clear()
         self.update_dashboard()
         print("\n♻️ Full state reset after trade/exit. Ready for next market.")
@@ -3280,7 +3475,7 @@ class MarketWorker:
     # ── PnL logging ────────────────────────────────────────────────────
 
     def log_pnl(self, outcome_type: str, pnl_amount: float, details: dict):
-        file_path       = f"{self.asset_type}_pnl_history.json"
+        file_path       = asset_pnl_filename(self.asset_type, self.window_slug)
         slug            = ((self.active_market.get("slug") if self.active_market else None)
                            or self.market_slug or "unknown")
         market_question = ((self.active_market.get("question", "Unknown")
@@ -3300,7 +3495,7 @@ class MarketWorker:
         # "Only one valid snapshot per market round": if this exact slug was
         # already logged (e.g. a retried exit path firing twice), skip the
         # second call entirely rather than double-counting the trade.
-        round_key = f"{self.asset_type}:{slug}"
+        round_key = f"{self.asset_type}:{self.window_slug}:{slug}"
         if slug != "unknown" and slug == self._last_logged_slug:
             print(f"ℹ️ [{self.asset_type.upper()}] log_pnl skipped duplicate call for "
                   f"already-logged market {slug}.")
@@ -3332,7 +3527,7 @@ class MarketWorker:
         self._last_logged_slug = slug
 
         # Cooldown risk tracker — separate from lifetime cumulative_pnl above.
-        asset_cooldown.record_realized_pnl(self.asset_type, pnl_amount)
+        asset_cooldown.record_realized_pnl(self.asset_type, self.window_slug, pnl_amount)
 
         # ── Live portfolio history snapshot ──────────────────────────────
         # Push a portfolio-total point to emiliano:portfolio:history right
@@ -3399,15 +3594,19 @@ class MarketWorker:
         market_end_iso   = None
         if self.active_market and self.active_market.get("expiry"):
             expiry           = self.active_market["expiry"]
-            start            = expiry - timedelta(seconds=MARKET_INTERVAL_SECONDS)
+            start            = expiry - timedelta(seconds=self._interval_seconds())
             market_end_iso   = expiry.isoformat()
             market_start_iso = start.isoformat()
 
-        cd = asset_cooldown.get_status(self.asset_type)
+        cd = asset_cooldown.get_status(self.asset_type, self.window_slug)
         schedule_ok = is_trading_allowed()
+        mom_sig = self.dashboard.get("momentum_signal", "NEUTRAL")
 
         return {
             "asset":              self.asset_type.upper(),
+            "window":             self.window_slug,
+            "strategy":           self.worker_config.strategy,
+            "execution_mode":     self.worker_config.execution_mode,
             "yes":                round(self.prices.get("YES", 0) * 100),
             "no":                 round(self.prices.get("NO",  0) * 100),
             "timer":              self.dashboard.get("timer",    "--:--"),
@@ -3416,9 +3615,12 @@ class MarketWorker:
             "position":           position_text,
             "outcome":            self.dashboard.get("outcome", "PENDING"),
             "trade_state":        self.trade_state.name,
-            "imbalance_ratio":    round(self.dashboard.get("imbalance_ratio",    0.0), 3),
-            "imbalance_momentum": round(self.dashboard.get("imbalance_momentum", 0.0), 3),
-            "imbalance_signal":   self.binance.signal_label if self.binance else "NO SIGNAL",
+            "price_delta_pct":    self.dashboard.get("price_delta", 0.0),
+            "signal_stale":       self.dashboard.get("signal_stale", True),
+            "momentum_signal":    mom_sig,
+            "entry_min_delta_pct": round(self.worker_config.entry_min_delta * 100, 4),
+            "lookback_secs":      self.worker_config.lookback_secs,
+            "dry_run":            self.is_dry_run(),
             "pnl_dollars":        round(pnl_dollars,         2),
             "pnl_pct":            round(pnl_pct,             2),
             "cumulative_pnl":     round(self.cumulative_pnl, 2),
@@ -3429,8 +3631,6 @@ class MarketWorker:
                                    if self.trade_count > 0 else 0.0),
             "market_start_iso":   market_start_iso,
             "market_end_iso":     market_end_iso,
-            "yes_threshold":      round(MIN_ENTRY_PRICE * 100),
-            "no_threshold":       round(MIN_ENTRY_PRICE * 100),
             "locked_low_c":       round(LOCKED_LOW  * 100),
             "locked_high_c":      round(LOCKED_HIGH * 100),
             "trading_allowed":    schedule_ok,
@@ -3501,10 +3701,11 @@ class MarketWorker:
     def get_candidate_markets(self, asset: Optional[str] = None) -> list:
         slug_asset = (asset or self.asset_type).lower()
         now       = int(datetime.now(timezone.utc).timestamp())
-        intervals = list(current_interval_starts(now))
+        intervals = list(self.current_interval_starts(now))
         markets   = []
+        sec = self._interval_seconds()
         for ts in intervals:
-            slug = market_slug(slug_asset, ts)
+            slug = self.worker_config.market_slug(ts)
             try:
                 resp = requests.get(f"{GAMMA_URL}?slug={slug}").json()
                 if resp:
@@ -3519,7 +3720,8 @@ class MarketWorker:
 
     def pick_next_market(self, markets: list) -> Optional[dict]:
         now_ts  = int(datetime.now(timezone.utc).timestamp())
-        current = [m for m in markets if m["start_ts"] <= now_ts < m["start_ts"] + MARKET_INTERVAL_SECONDS]
+        sec = self._interval_seconds()
+        current = [m for m in markets if m["start_ts"] <= now_ts < m["start_ts"] + sec]
         if current:
             return current[0]
         future = [m for m in markets if m["start_ts"] > now_ts]
@@ -3528,26 +3730,27 @@ class MarketWorker:
         return min(future, key=lambda x: x["start_ts"])
 
     async def start(self):
-        """
-        Per-asset trading loop. The wallet audit is NOT run here — it already
-        ran exactly once, account-wide, in main() before any MarketWorker was
-        started. This method only scans for and trades this worker's market.
-        """
-        print(f"🤖 EmilianoBot (V2) — 90-Cent Single-Leg Entry → "
-              f"Monitoring {self.asset_type} {MARKET_INTERVAL_SLUG} markets...")
-        print(f"  Market interval   : {MARKET_INTERVAL_SLUG} ({MARKET_INTERVAL_SECONDS}s)")
-        print(f"  Listener window   : final {LISTENER_ACTIVATE_SECONDS}s")
-        print(f"  Entry threshold : ≥{round(MIN_ENTRY_PRICE*100)}c | "
-              f"Locked-price skip: {round(LOCKED_LOW*100)}c & {round(LOCKED_HIGH*100)}c | "
-              f"Size: {POSITION_SIZE}")
+        """Per-worker trading loop for one (asset, window) pair."""
+        wc = self.worker_config
+        print(f"🤖 EmilianoBot — {wc.strategy.upper()} → "
+              f"{self.asset_type.upper()} {self.window_slug} markets...")
+        print(f"  Strategy          : {wc.strategy} ({wc.execution_mode})")
+        print(f"  Market interval   : {self.window_slug} ({wc.interval_seconds}s)")
+        print(f"  Listener window   : final {wc.listener_activate_secs}s")
+        print(f"  Size              : {wc.momentum_size} shares (max {wc.max_buy_order_size})")
+        print(f"  Dry run           : {self.is_dry_run()}")
+        if wc.strategy == "momentum":
+            print(f"  Signal            : lookback={wc.lookback_secs}s "
+                  f"min_delta={wc.entry_min_delta*100:.3f}%")
         session = requests.Session()
+        sec = wc.interval_seconds
         while True:
             try:
                 now_ts     = int(datetime.now(timezone.utc).timestamp())
-                intervals  = list(current_interval_starts(now_ts))
+                intervals  = list(self.current_interval_starts(now_ts))
                 candidates = []
                 for ts in intervals:
-                    slug = market_slug(self.asset_type, ts)
+                    slug = wc.market_slug(ts)
                     try:
                         resp = session.get(f"{GAMMA_URL}?slug={slug}", timeout=2).json()
                         if resp:
@@ -3559,7 +3762,7 @@ class MarketWorker:
                     except Exception:
                         continue
 
-                current = [m for m in candidates if m["start_ts"] <= now_ts < m["start_ts"] + MARKET_INTERVAL_SECONDS]
+                current = [m for m in candidates if m["start_ts"] <= now_ts < m["start_ts"] + sec]
                 if current:
                     target = current[0]
                 else:
@@ -3579,7 +3782,7 @@ class MarketWorker:
                 await self.reset_state()
                 now_ts = int(datetime.now(timezone.utc).timestamp())
                 start  = target["start_ts"]
-                if start <= now_ts < start + MARKET_INTERVAL_SECONDS:
+                if start <= now_ts < start + sec:
                     print("⚡ Already inside active market → starting immediately")
 
                 print("📡 Starting price listener...")
@@ -3613,8 +3816,8 @@ def create_dashboard(bots):
     layout.split_column(
         Layout(
             Panel(
-                f"[bold cyan]EMILIANO BOT — 90-Cent Single-Leg Entry | "
-                f"Binance WS Signal (Display)[/bold cyan]\n"
+                f"[bold cyan]EMILIANO BOT — Momentum / Legacy Strategies | "
+                f"Binance Spot aggTrade[/bold cyan]\n"
                 f"Schedule ({_tz_label}): {_schedule_str}",
                 style="bold green", box=box.ROUNDED,
             ),
@@ -3644,29 +3847,23 @@ def create_dashboard(bots):
         else:
             display_status = d.get('status', 'WAITING')
 
-        cd = asset_cooldown.get_status(bot.asset_type)
+        cd = asset_cooldown.get_status(bot.asset_type, bot.window_slug)
         if cd.get("cooldown_active"):
             rem = cd.get("cooldown_remaining_sec", 0)
             display_status = f"COOLDOWN {rem // 60}m{rem % 60:02d}s"
 
-        # Binance signal display
-        ratio    = d.get('imbalance_ratio',    0.0)
-        momentum = d.get('imbalance_momentum', 0.0)
-        if ratio > 0.22 or (ratio > 0.15 and momentum > 0.07):
-            ratio_text = f"[bold green]↑ {ratio:+.3f} STRONG BULLISH[/bold green]"
-        elif ratio > 0.12:
-            ratio_text = f"[green]↑ {ratio:+.3f} Bullish[/green]"
-        elif ratio < -0.22 or (ratio < -0.15 and momentum < -0.07):
-            ratio_text = f"[bold red]↓ {ratio:+.3f} STRONG BEARISH[/bold red]"
-        elif ratio < -0.12:
-            ratio_text = f"[red]↓ {ratio:+.3f} Bearish[/red]"
+        delta_pct = d.get("price_delta", 0.0)
+        mom_sig   = d.get("momentum_signal", "NEUTRAL")
+        if "BULL" in mom_sig:
+            ratio_text = f"[bold green]{mom_sig}[/bold green]"
+        elif "BEAR" in mom_sig:
+            ratio_text = f"[bold red]{mom_sig}[/bold red]"
+        elif mom_sig == "STALE":
+            ratio_text = f"[yellow]{mom_sig}[/yellow]"
         else:
-            ratio_text = f"[white]{ratio:+.3f} Neutral[/white]"
+            ratio_text = f"[white]{mom_sig} (Δ {delta_pct:+.3f}%)[/white]"
 
-        momentum_text = ""
-        if abs(momentum) > 0.04:
-            mom_color     = "green" if momentum > 0 else "red"
-            momentum_text = f" | Mom: [{mom_color}]{momentum:+.3f}[/{mom_color}]"
+        momentum_text = f" | {bot.worker_config.execution_mode}"
 
         # Card border color based on trade state
         if bot.trade_state == TradeState.FILLED:
@@ -3681,7 +3878,7 @@ def create_dashboard(bots):
             expiry_utc  = bot.active_market["expiry"]
             et_zone     = ET_ZONE
             expiry_et   = expiry_utc.astimezone(et_zone)
-            start_et    = expiry_et - timedelta(seconds=MARKET_INTERVAL_SECONDS)
+            start_et    = expiry_et - timedelta(seconds=bot._interval_seconds())
             time_window = (f"{start_et.strftime('%b %d')}, "
                            f"{start_et.strftime('%I:%M%p')}-{expiry_et.strftime('%I:%M%p')} ET")
         else:
@@ -3695,8 +3892,9 @@ def create_dashboard(bots):
             )
         else:
             bought_text = (
-                f"[dim]Entry: ≥{round(MIN_ENTRY_PRICE*100)}c | "
-                f"Skip locked: {round(LOCKED_LOW*100)}c & {round(LOCKED_HIGH*100)}c[/dim]"
+                f"[dim]{bot.worker_config.strategy} | "
+                f"size={bot.worker_config.momentum_size} sh | "
+                f"Δ≥{bot.worker_config.entry_min_delta*100:.2f}%[/dim]"
             )
 
         cd_pnl_color = "red" if cd.get("cooldown_window_pnl", 0) < 0 else "green"
@@ -3894,18 +4092,17 @@ async def main():
     account.start_pnl_merge_scheduler()
 
     # Per-asset market workers — concurrent, but each is purely market-scoped.
-    bots = [MarketWorker(asset, account) for asset in TRADING_ASSETS]
+    bots = [MarketWorker(wc, account) for wc in WORKER_CONFIGS]
 
     await asyncio.gather(*[bot.start() for bot in bots], dashboard_loop(bots))
 
 
 if __name__ == "__main__":
     try:
-        print("🚀 Starting EmilianoBot — 90-Cent Single-Leg Directional Mode...")
-        print(f"   Market interval : {MARKET_INTERVAL_SLUG} ({MARKET_INTERVAL_SECONDS}s)")
-        print(f"   Entry: ≥{round(MIN_ENTRY_PRICE*100)}c | "
-              f"Skip locked: {round(LOCKED_LOW*100)}c & {round(LOCKED_HIGH*100)}c | "
-              f"Size: {POSITION_SIZE} shares")
+        print("🚀 Starting EmilianoBot — Momentum Mode...")
+        for wc in WORKER_CONFIGS:
+            print(f"   {wc.asset.upper()} {wc.window}: {wc.strategy} / {wc.execution_mode} "
+                  f"| size={wc.momentum_size} | dry_run={wc.dry_run}")
         asyncio.run(main())
     except KeyboardInterrupt:
         console.print("\n[bold yellow]👋 EmilianoBot shutting down...[/bold yellow]")
