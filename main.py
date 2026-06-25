@@ -223,6 +223,14 @@ async def _initialize_bots():
                 print(f"⚠️  [trade-history] Non-fatal backfill error: {th_err}")
                 traceback.print_exc()
 
+        try:
+            from signals.binance_agg_trade import BinanceAggTradeSignal
+            from config import TRADING_ASSETS
+            await BinanceAggTradeSignal.warm_assets(TRADING_ASSETS)
+        except Exception as bf_err:
+            print(f"⚠️  [Binance feeds] Warm-up failed (non-fatal): {bf_err}")
+            traceback.print_exc()
+
         asyncio.create_task(run_all_bots())
         print("🎉 All bots started successfully!")
 

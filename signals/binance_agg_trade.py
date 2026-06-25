@@ -6,7 +6,7 @@ import asyncio
 import json
 import time as t
 from collections import deque
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, Iterable, Optional, Set, Tuple
 
 import websockets  # type: ignore
 
@@ -27,20 +27,44 @@ class BinanceAggTradeSignal:
         async with cls._instance_lock:
             sym = symbol.upper()
             if sym not in cls._instances:
-                inst = cls(sym)
-                cls._instances[sym] = inst
-                asyncio.create_task(inst._run())
-            return cls._instances[sym]
+                cls._instances[sym] = cls(sym)
+            inst = cls._instances[sym]
+            inst.ensure_task()
+            return inst
+
+    @classmethod
+    async def warm_assets(cls, assets: Iterable[str]) -> None:
+        """Eager-start one aggTrade feed per unique asset (call at bot startup)."""
+        seen: Set[str] = set()
+        for asset in assets:
+            sym = (asset or "").strip().upper().split("-")[0]
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            await cls.get_or_create(sym)
+        if seen:
+            print(
+                f"📡 [Binance futures aggTrade] Warmed feeds for: "
+                + ", ".join(sorted(seen))
+            )
 
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
         self.last_price = 0.0
         self.last_update = 0.0
         self._prices: Deque[Tuple[float, float]] = deque()
-        self._running = False
+        self._run_task: Optional[asyncio.Task] = None
+        self.connection_status = "pending"  # pending | connecting | connected | error
+        self.last_error: Optional[str] = None
+
+    def ensure_task(self) -> None:
+        if self._run_task is None or self._run_task.done():
+            self._run_task = asyncio.create_task(self._run())
 
     @property
     def is_stale(self) -> bool:
+        if self.connection_status in ("pending", "connecting"):
+            return True
         if self.last_update <= 0:
             return True
         return (t.time() - self.last_update) >= STALE_CUTOFF_SECS
@@ -48,6 +72,19 @@ class BinanceAggTradeSignal:
     @property
     def is_fresh(self) -> bool:
         return not self.is_stale
+
+    @property
+    def status_label(self) -> str:
+        if self.connection_status == "connecting":
+            return "CONNECTING"
+        if self.connection_status == "error" and self.last_update <= 0:
+            err = (self.last_error or "unknown")[:40]
+            return f"ERROR ({err})"
+        if self.last_update <= 0:
+            return "WARMING UP"
+        if self.is_stale:
+            return "STALE"
+        return "LIVE"
 
     def price_delta(self, lookback_secs: float) -> Optional[float]:
         """Percent move over lookback_secs. None if insufficient data."""
@@ -81,6 +118,7 @@ class BinanceAggTradeSignal:
         now = ts if ts is not None else t.time()
         self.last_price = price
         self.last_update = now
+        self.connection_status = "connected"
         self._prices.append((now, price))
         self._trim(now)
 
@@ -95,13 +133,12 @@ class BinanceAggTradeSignal:
         return px, trade_ts if trade_ts > 0 else t.time()
 
     async def _run(self) -> None:
-        if self._running:
-            return
-        self._running = True
         stream = f"{self.symbol.lower()}usdt@aggTrade"
         url = f"{_FUTURES_WS_BASE}/ws/{stream}"
         while True:
             try:
+                self.connection_status = "connecting"
+                self.last_error = None
                 print(
                     f"📡 [Binance futures aggTrade] {self.symbol}: "
                     f"connecting to {url} (timeout {_CONNECT_TIMEOUT_SECS}s)..."
@@ -112,6 +149,7 @@ class BinanceAggTradeSignal:
                     ping_timeout=15,
                     open_timeout=_CONNECT_TIMEOUT_SECS,
                 ) as ws:
+                    self.connection_status = "connected"
                     print(f"📡 [Binance futures aggTrade] Connected: {stream}")
                     async for raw in ws:
                         parsed = self._parse_trade_message(raw)
@@ -120,6 +158,8 @@ class BinanceAggTradeSignal:
                         px, trade_ts = parsed
                         self._on_trade(px, trade_ts)
             except Exception as e:
+                self.connection_status = "error"
+                self.last_error = str(e)
                 print(
                     f"⚠️ [Binance aggTrade] {self.symbol}: {e} — "
                     f"reconnecting in 3s (endpoint: {_FUTURES_WS_BASE})"

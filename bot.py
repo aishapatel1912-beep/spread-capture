@@ -2465,11 +2465,24 @@ class MarketWorker:
     def update_momentum_dashboard(self, signal, delta: Optional[float]) -> None:
         self.dashboard["price_delta"] = round(float(delta or 0.0) * 100, 4)
         self.dashboard["signal_stale"] = signal.is_stale
+        self.dashboard["binance_status"] = signal.status_label
+
+        if signal.connection_status in ("pending", "connecting"):
+            self.dashboard["momentum_signal"] = "CONNECTING"
+            return
+        if signal.connection_status == "error" and signal.last_update <= 0:
+            self.dashboard["momentum_signal"] = signal.status_label
+            return
+        if signal.last_update <= 0:
+            self.dashboard["momentum_signal"] = "WARMING UP"
+            return
         if signal.is_stale:
             self.dashboard["momentum_signal"] = "STALE"
-        elif delta is None:
+            return
+        if delta is None:
             self.dashboard["momentum_signal"] = "WARMING UP"
-        elif delta >= self.worker_config.entry_min_delta:
+            return
+        if delta >= self.worker_config.entry_min_delta:
             self.dashboard["momentum_signal"] = f"BULL ↑ {self.dashboard['price_delta']:+.3f}%"
         elif delta <= -self.worker_config.entry_min_delta:
             self.dashboard["momentum_signal"] = f"BEAR ↓ {self.dashboard['price_delta']:+.3f}%"
@@ -2711,8 +2724,10 @@ class MarketWorker:
 
         if self.worker_config.strategy == "momentum":
             sig = self.dashboard.get("momentum_signal", "NEUTRAL")
+            bstat = self.dashboard.get("binance_status", "")
+            extra = f" feed={bstat}" if bstat and bstat not in sig else ""
             print(f"⏳ [IDLE] {self.asset_type.upper()} {self.window_slug} | "
-                  f"YES={y_c}c NO={n_c}c | Binance: {sig}")
+                  f"YES={y_c}c NO={n_c}c | Binance: {sig}{extra}")
 
     async def _check_single_side_exit(self, side: Optional[str]) -> bool:
         """
