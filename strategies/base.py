@@ -8,19 +8,36 @@ from typing import TYPE_CHECKING, Literal, Optional, Protocol
 if TYPE_CHECKING:
     from bot import MarketWorker
 
-ExecutionMode = Literal["single_taker", "gtc_at_ask", "single_maker", "dual_hybrid"]
+SpreadMode = Literal["dual", "rebalance"]
+
+
+@dataclass(frozen=True)
+class SpreadDecision:
+    yes_price: float
+    no_price: float
+    size: int
+    edge: float
+    mode: SpreadMode = "dual"
+    rebalance_side: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class EntryDecision:
     side: str
     price: float
-    execution_mode: ExecutionMode
+    execution_mode: str
     size: int
-    delta: Optional[float] = None
 
 
-class Strategy(Protocol):
+class SpreadStrategyProtocol(Protocol):
+    async def evaluate(self, worker: "MarketWorker") -> Optional[SpreadDecision]:
+        ...
+
+    async def execute(self, worker: "MarketWorker", decision: SpreadDecision) -> None:
+        ...
+
+
+class LegacyStrategyProtocol(Protocol):
     async def evaluate(self, worker: "MarketWorker") -> Optional[EntryDecision]:
         ...
 

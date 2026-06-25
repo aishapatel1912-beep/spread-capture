@@ -49,9 +49,10 @@ from config import (
     validate_trading_assets,
     worker_key,
 )
-from strategies.base import EntryDecision
+from strategies.base import EntryDecision, SpreadDecision
 from strategies.legacy import LegacyStrategy
-from strategies.momentum import MomentumStrategy
+from strategies.spread_capture import SpreadCaptureStrategy
+from utils.spread_inventory import SpreadInventory
 from utils.clob_helpers import clamp_buy_price, clamp_sell_price, parse_order_type
 
 console = Console()
@@ -445,6 +446,11 @@ class TradeState(Enum):
     CLOSED  = auto()
     # Unexpected failure. Logged; no further orders until reset_state().
     ERROR   = auto()
+
+
+class SpreadState(Enum):
+    IDLE    = auto()
+    PENDING = auto()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2282,9 +2288,13 @@ class MarketWorker:
         self.start_delay_met   = False
         self.market_start_time: Optional[float] = None
 
-        self.dummy_balance  = float(worker_config.momentum_size)
+        self.dummy_balance  = float(worker_config.spread_size)
         self.last_trade_time = 0
         self.logged_markets  = set()
+
+        self.spread_state: SpreadState = SpreadState.IDLE
+        self.spread_inventory = SpreadInventory()
+        self.spread_captures = 0
 
         self.last_yes_update = 0.0
         self.last_no_update  = 0.0
@@ -2319,6 +2329,13 @@ class MarketWorker:
             "signal_stale":       True,
             "execution_mode":     worker_config.execution_mode,
             "strategy":           worker_config.strategy,
+            "combined_bid_c":     0,
+            "spread_edge":        0.0,
+            "yes_bid_c":          0,
+            "no_bid_c":           0,
+            "yes_shares":         0.0,
+            "no_shares":          0.0,
+            "spread_imbalance":   0.0,
         }
         self.recent_logs: Deque[str] = deque(maxlen=4)
 
@@ -2329,7 +2346,7 @@ class MarketWorker:
         if worker_config.strategy == "legacy":
             self.strategy = LegacyStrategy()
         else:
-            self.strategy = MomentumStrategy()
+            self.strategy = SpreadCaptureStrategy()
 
         _register_worker(self)
 
@@ -2456,11 +2473,124 @@ class MarketWorker:
     def is_dry_run(self) -> bool:
         return self.worker_config.dry_run
 
-    def order_size_shares(self) -> Optional[int]:
-        size = min(self.worker_config.momentum_size, self.worker_config.max_buy_order_size)
+    def spread_order_size(self) -> Optional[int]:
+        size = min(self.worker_config.spread_size, self.worker_config.max_order_size)
         if size < MIN_SHARES:
             return None
         return size
+
+    def order_size_shares(self) -> Optional[int]:
+        wc = self.worker_config
+        size = min(wc.legacy_size, wc.max_order_size)
+        if size < MIN_SHARES:
+            return None
+        return size
+
+    def _update_spread_dashboard(self) -> None:
+        up_bid = self.bids.get("YES", 0.0)
+        down_bid = self.bids.get("NO", 0.0)
+        combined = (up_bid + down_bid) if up_bid > 0 and down_bid > 0 else 0.0
+        edge = round(1.0 - combined, 4) if combined > 0 else 0.0
+        inv = self.spread_inventory
+        self.dashboard["combined_bid_c"] = round(combined * 100)
+        self.dashboard["spread_edge"] = edge
+        self.dashboard["yes_bid_c"] = round(up_bid * 100)
+        self.dashboard["no_bid_c"] = round(down_bid * 100)
+        self.dashboard["yes_shares"] = round(inv.yes_shares, 2)
+        self.dashboard["no_shares"] = round(inv.no_shares, 2)
+        self.dashboard["spread_imbalance"] = round(inv.imbalance, 2)
+        if inv.yes_shares > 0 or inv.no_shares > 0:
+            self.dashboard["status"] = (
+                f"SPREAD Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f}"
+            )
+
+    def _spread_rebalance_decision(
+        self,
+        *,
+        underweight: str,
+        up_bid: float,
+        down_bid: float,
+        edge: float,
+        size: int,
+    ) -> SpreadDecision:
+        bias = self.worker_config.price_bias
+        if underweight == "YES":
+            ask = self.prices.get("YES", 1.0)
+            yes_px = round(up_bid + bias, 2)
+            if ask > 0.02:
+                yes_px = min(yes_px, round(ask - 0.01, 2))
+            return SpreadDecision(
+                yes_price=yes_px,
+                no_price=0.0,
+                size=size,
+                edge=edge,
+                mode="rebalance",
+                rebalance_side="YES",
+            )
+        ask = self.prices.get("NO", 1.0)
+        no_px = round(down_bid + bias, 2)
+        if ask > 0.02:
+            no_px = min(no_px, round(ask - 0.01, 2))
+        return SpreadDecision(
+            yes_price=0.0,
+            no_price=no_px,
+            size=size,
+            edge=edge,
+            mode="rebalance",
+            rebalance_side="NO",
+        )
+
+    def _log_spread_capture(
+        self,
+        decision: SpreadDecision,
+        *,
+        dry_run: bool = False,
+        fills: Optional[Dict[str, Tuple[float, float]]] = None,
+    ) -> None:
+        self.spread_captures += 1
+        inv = self.spread_inventory
+        mode = "DRY" if dry_run else "LIVE"
+        fill_parts = []
+        if fills:
+            for side, (sz, px) in fills.items():
+                fill_parts.append(f"{side}={sz:.2f}@{round(px*100)}c")
+        fill_str = " ".join(fill_parts) if fill_parts else "simulated"
+        msg = (
+            f"[SPREAD {mode}] {decision.mode} edge={decision.edge:.4f} "
+            f"size={decision.size} | {fill_str} | "
+            f"inv Y={inv.yes_shares:.1f} N={inv.no_shares:.1f}"
+        )
+        self.log_to_file(msg)
+        self.add_log(msg[:120])
+
+    async def place_spread_gtc(
+        self, side: str, price: float, size: int,
+    ) -> Tuple[Optional[str], float]:
+        ok, order_id, filled = await self.place_order_raw(
+            side, price, size, order_type="GTC",
+        )
+        if not ok:
+            return None, 0.0
+        if filled and order_id:
+            return order_id, float(size)
+        return order_id, 0.0
+
+    async def poll_order_fill(self, order_id: str, requested: int) -> float:
+        try:
+            info = self.account.get_order_status(order_id)
+            if isinstance(info, str):
+                info = json.loads(info)
+            if isinstance(info, dict):
+                matched = (
+                    info.get("size_matched")
+                    or info.get("sizeMatched")
+                    or info.get("matched_size")
+                    or 0
+                )
+                return min(float(matched), float(requested))
+        except Exception:
+            pass
+        return 0.0
 
     def update_momentum_dashboard(self, signal, delta: Optional[float]) -> None:
         self.dashboard["price_delta"] = round(float(delta or 0.0) * 100, 4)
@@ -2675,7 +2805,7 @@ class MarketWorker:
     # ═════════════════════════════════════════════════════════════════════
 
     async def check_logic(self, timer: str):
-        """Strategy-driven entry; TP/SL when FILLED."""
+        """Strategy-driven entry; legacy TP/SL when FILLED."""
         y = self.prices.get("YES", 0.0)
         n = self.prices.get("NO",  0.0)
         if y <= 0 or n <= 0:
@@ -2687,6 +2817,10 @@ class MarketWorker:
         self.dashboard["no"]    = n_c
         self.dashboard["timer"] = timer
         self.update_dashboard()
+
+        if self.worker_config.strategy == "spread_capture":
+            await self._check_spread_logic(y_c, n_c)
+            return
 
         if self.trade_state == TradeState.FILLED:
             await self._check_single_side_exit(self.position_side)
@@ -2708,26 +2842,59 @@ class MarketWorker:
 
         decision = await self.strategy.evaluate(self)
         if decision:
-            delta_str = f" delta={decision.delta*100:.3f}%" if decision.delta is not None else ""
             print(f"[ENTRY] {self.asset_type.upper()} {self.window_slug} | "
                   f"{decision.side} @ {round(decision.price*100)}c | "
-                  f"mode={decision.execution_mode} size={decision.size}{delta_str}")
+                  f"mode={decision.execution_mode} size={decision.size}")
             self.log_to_file(
                 f"[ENTRY] {decision.side} @ {round(decision.price*100)}c "
-                f"mode={decision.execution_mode} size={decision.size}{delta_str}"
+                f"mode={decision.execution_mode} size={decision.size}"
             )
             async with self._order_lock:
                 if self.trade_state != TradeState.IDLE:
                     return
                 await self.strategy.execute(self, decision)
+
+    async def _check_spread_logic(self, y_c: int, n_c: int) -> None:
+        self._update_spread_dashboard()
+
+        if self.spread_state == SpreadState.PENDING:
+            return
+        if self._order_lock.locked():
             return
 
-        if self.worker_config.strategy == "momentum":
-            sig = self.dashboard.get("momentum_signal", "NEUTRAL")
-            bstat = self.dashboard.get("binance_status", "")
-            extra = f" feed={bstat}" if bstat and bstat not in sig else ""
-            print(f"⏳ [IDLE] {self.asset_type.upper()} {self.window_slug} | "
-                  f"YES={y_c}c NO={n_c}c | Binance: {sig}{extra}")
+        if not is_trading_allowed():
+            log_weekend_block(self.asset_type, "YES/NO", round(max(y_c, n_c)))
+            return
+
+        if asset_cooldown.is_entry_blocked(self.asset_type, self.window_slug):
+            log_cooldown_block(
+                self.asset_type, self.window_slug, "YES/NO", round(max(y_c, n_c)),
+            )
+            return
+
+        decision = await self.strategy.evaluate(self)
+        if decision:
+            mode = decision.mode.upper()
+            print(
+                f"[SPREAD] {self.asset_type.upper()} {self.window_slug} | "
+                f"{mode} edge={decision.edge:.4f} size={decision.size}"
+            )
+            async with self._order_lock:
+                if self.spread_state != SpreadState.IDLE:
+                    return
+                await self.strategy.execute(self, decision)
+            return
+
+        comb = self.dashboard.get("combined_bid_c", 0)
+        edge = self.dashboard.get("spread_edge", 0.0)
+        thr = self.worker_config.spread_threshold
+        inv = self.spread_inventory
+        print(
+            f"⏳ [IDLE] {self.asset_type.upper()} {self.window_slug} | "
+            f"YES={y_c}c NO={n_c}c | bids={comb}c edge={edge:.4f} "
+            f"(need>{thr:.4f}) | inv Y={inv.yes_shares:.0f} N={inv.no_shares:.0f} "
+            f"caps={self.spread_captures}"
+        )
 
     async def _check_single_side_exit(self, side: Optional[str]) -> bool:
         """
@@ -3139,7 +3306,14 @@ class MarketWorker:
     async def manual_cashout(self) -> dict:
         """
         Dashboard-triggered cashout. Uses the same close path as TP/SL exits.
+        Not available for spread_capture workers.
         """
+        if self.worker_config.strategy == "spread_capture":
+            return {
+                "ok": False,
+                "error": "Cashout not available for spread capture strategy",
+                "asset": self.asset_type.upper(),
+            }
         if self._cashout_in_progress:
             return {"ok": False, "error": "Cashout already in progress",
                     "asset": self.asset_type.upper()}
@@ -3172,8 +3346,50 @@ class MarketWorker:
     def get_position_snapshot(self) -> Optional[Dict]:
         """
         Live open-position row for the dashboard Positions tab.
-        Returns None when no FILLED position exists.
+        Returns None when no open position / inventory exists.
         """
+        if self.worker_config.strategy == "spread_capture":
+            inv = self.spread_inventory
+            if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
+                return None
+            slug = ((self.active_market.get("slug") if self.active_market else None)
+                    or self.market_slug or self.asset_type)
+            market_name = ((self.active_market.get("question") if self.active_market else None)
+                           or f"{self.asset_type.upper()} Up or Down")
+            matched = inv.matched_pairs
+            yes_bid = self.bids.get("YES", 0.0)
+            no_bid = self.bids.get("NO", 0.0)
+            mark_value = (
+                matched * 1.0
+                + inv.yes_shares * yes_bid
+                + inv.no_shares * no_bid
+                - matched * (yes_bid + no_bid)
+            )
+            total_cost = inv.yes_cost + inv.no_cost
+            unrealized = round(mark_value - total_cost, 4)
+            return {
+                "id":                  f"{self.asset_type}:{self.window_slug}:{slug}:spread",
+                "asset":               self.asset_type.upper(),
+                "window":              self.window_slug,
+                "market":              market_name,
+                "slug":                slug,
+                "side":                "SPREAD",
+                "strategy":            "spread_capture",
+                "yes_shares":          round(inv.yes_shares, 4),
+                "no_shares":           round(inv.no_shares, 4),
+                "matched_pairs":       round(matched, 4),
+                "spread_imbalance":    round(inv.imbalance, 4),
+                "entry_price":         0.0,
+                "current_price":       0.0,
+                "entry_price_cents":   0.0,
+                "current_price_cents": 0.0,
+                "roi_pct":             0.0,
+                "unrealized_pnl":      unrealized,
+                "size":                round(inv.yes_shares + inv.no_shares, 4),
+                "size_usd":            round(total_cost, 2),
+                "cashout_available":   False,
+            }
+
         if self.trade_state != TradeState.FILLED:
             return None
         if not self.position_side or self.position_size <= MIN_FILL_DELTA:
@@ -3483,6 +3699,16 @@ class MarketWorker:
         self.dashboard["profit"]            = 0.0
         self.dashboard["price_delta"]       = 0.0
         self.dashboard["signal_stale"]      = True
+        self.dashboard["combined_bid_c"]    = 0
+        self.dashboard["spread_edge"]       = 0.0
+        self.dashboard["yes_bid_c"]         = 0
+        self.dashboard["no_bid_c"]          = 0
+        self.dashboard["yes_shares"]        = 0.0
+        self.dashboard["no_shares"]         = 0.0
+        self.dashboard["spread_imbalance"]  = 0.0
+        self.spread_state = SpreadState.IDLE
+        self.spread_inventory.reset()
+        self.spread_captures = 0
         self.recent_logs.clear()
         self.update_dashboard()
         print("\n♻️ Full state reset after trade/exit. Ready for next market.")
@@ -3615,7 +3841,20 @@ class MarketWorker:
 
         cd = asset_cooldown.get_status(self.asset_type, self.window_slug)
         schedule_ok = is_trading_allowed()
-        mom_sig = self.dashboard.get("momentum_signal", "NEUTRAL")
+
+        spread_status = "IDLE"
+        if self.worker_config.strategy == "spread_capture":
+            spread_status = (
+                "PENDING" if self.spread_state == SpreadState.PENDING else "HUNTING"
+            )
+            inv = self.spread_inventory
+            if inv.yes_shares > 0 or inv.no_shares > 0:
+                position_text = (
+                    f"Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f} "
+                    f"(±{inv.imbalance:.0f}) ×{self.spread_captures}"
+                )
+            else:
+                position_text = f"spread (edge>{self.worker_config.spread_threshold:.3f})"
 
         return {
             "asset":              self.asset_type.upper(),
@@ -3624,17 +3863,23 @@ class MarketWorker:
             "execution_mode":     self.worker_config.execution_mode,
             "yes":                round(self.prices.get("YES", 0) * 100),
             "no":                 round(self.prices.get("NO",  0) * 100),
+            "yes_bid_c":          self.dashboard.get("yes_bid_c", 0),
+            "no_bid_c":           self.dashboard.get("no_bid_c", 0),
+            "combined_bid_c":     self.dashboard.get("combined_bid_c", 0),
+            "spread_edge":        self.dashboard.get("spread_edge", 0.0),
+            "spread_threshold":   self.worker_config.spread_threshold,
+            "yes_shares":         self.dashboard.get("yes_shares", 0.0),
+            "no_shares":          self.dashboard.get("no_shares", 0.0),
+            "spread_imbalance":   self.dashboard.get("spread_imbalance", 0.0),
+            "spread_captures":    self.spread_captures,
+            "spread_state":       spread_status,
             "timer":              self.dashboard.get("timer",    "--:--"),
             "listener":           self.get_listener_countdown(),
-            "status":             status,
+            "status":             status if self.worker_config.strategy != "spread_capture"
+                                  else spread_status,
             "position":           position_text,
             "outcome":            self.dashboard.get("outcome", "PENDING"),
             "trade_state":        self.trade_state.name,
-            "price_delta_pct":    self.dashboard.get("price_delta", 0.0),
-            "signal_stale":       self.dashboard.get("signal_stale", True),
-            "momentum_signal":    mom_sig,
-            "entry_min_delta_pct": round(self.worker_config.entry_min_delta * 100, 4),
-            "lookback_secs":      self.worker_config.lookback_secs,
             "dry_run":            self.is_dry_run(),
             "pnl_dollars":        round(pnl_dollars,         2),
             "pnl_pct":            round(pnl_pct,             2),
@@ -3670,9 +3915,13 @@ class MarketWorker:
             self.market_outcome = "UNKNOWN"
         self.dashboard["outcome"] = self.market_outcome
 
+        if self.worker_config.strategy == "spread_capture":
+            self._settle_spread_market()
+            return
+
         if not self.position_side or self.position_size <= 0:
             print(f"\n{BOLD}{YELLOW}ℹ️  No position taken this market.{RESET}")
-            self.account.merge_now()
+            self._finish_market_merge()
             return
 
         total_spent   = self.entry_price * self.position_size
@@ -3703,6 +3952,66 @@ class MarketWorker:
             "duration_seconds": round(t.time() - (self.entry_timestamp or t.time()), 2),
         })
 
+        self._finish_market_merge()
+
+    def _settle_spread_market(self) -> None:
+        inv = self.spread_inventory
+        outcome = self.market_outcome or "UNKNOWN"
+        price_in_cents = lambda p: f"{round(p * 100)}c"
+
+        if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
+            print(f"\n{BOLD}{YELLOW}ℹ️  No spread inventory this market "
+                  f"({self.spread_captures} capture attempts).{RESET}")
+            self._finish_market_merge()
+            return
+
+        matched = inv.matched_pairs
+        yes_unpaired = max(0.0, inv.yes_shares - matched)
+        no_unpaired = max(0.0, inv.no_shares - matched)
+        total_cost = inv.yes_cost + inv.no_cost
+
+        settlement = matched * 1.0
+        if outcome == "YES":
+            settlement += yes_unpaired * 1.0
+        elif outcome == "NO":
+            settlement += no_unpaired * 1.0
+
+        actual_profit = round(settlement - total_cost, 4)
+
+        print(f"\n\n{BOLD}{GREEN}--- 📊 SPREAD SETTLEMENT ---{RESET}")
+        print(f"⏱️ Market Outcome:      {outcome}")
+        print(f"📦 Captures this round: {self.spread_captures}")
+        print(f"📊 YES shares:          {inv.yes_shares:.4f} "
+              f"(avg {price_in_cents(inv.avg_cost('YES'))})")
+        print(f"📊 NO shares:           {inv.no_shares:.4f} "
+              f"(avg {price_in_cents(inv.avg_cost('NO'))})")
+        print(f"🔗 Matched pairs:       {matched:.4f}")
+        print(f"📉 Total invested:      ${total_cost:.4f}")
+        print(f"💵 Settlement value:    ${settlement:.4f}")
+        print(f"📈 Net Profit:          {GREEN if actual_profit >= 0 else RED}"
+              f"${actual_profit:.4f}{RESET}")
+
+        if matched > 0:
+            self.log_trade("YES", 1.0, "redeem", size=matched)
+        if outcome == "YES" and yes_unpaired > 0:
+            self.log_trade("YES", 1.0, "redeem", size=yes_unpaired)
+        elif outcome == "NO" and no_unpaired > 0:
+            self.log_trade("NO", 1.0, "redeem", size=no_unpaired)
+
+        self.log_pnl("SPREAD_SETTLE", actual_profit, {
+            "outcome":          outcome,
+            "yes_shares":       inv.yes_shares,
+            "no_shares":        inv.no_shares,
+            "matched_pairs":    matched,
+            "yes_unpaired":     yes_unpaired,
+            "no_unpaired":      no_unpaired,
+            "total_cost":       total_cost,
+            "settlement_value": settlement,
+            "spread_captures":  self.spread_captures,
+        })
+        self._finish_market_merge()
+
+    def _finish_market_merge(self) -> None:
         global completed_markets
         completed_markets += 1
         if completed_markets >= TOTAL_BOTS:
@@ -3749,14 +4058,18 @@ class MarketWorker:
         wc = self.worker_config
         print(f"🤖 EmilianoBot — {wc.strategy.upper()} → "
               f"{self.asset_type.upper()} {self.window_slug} markets...")
-        print(f"  Strategy          : {wc.strategy} ({wc.execution_mode})")
+        print(f"  Strategy          : {wc.strategy}")
         print(f"  Market interval   : {self.window_slug} ({wc.interval_seconds}s)")
         print(f"  Listener window   : final {wc.listener_activate_secs}s")
-        print(f"  Size              : {wc.momentum_size} shares (max {wc.max_buy_order_size})")
+        if wc.strategy == "spread_capture":
+            print(f"  Spread threshold  : {wc.spread_threshold:.4f} ({wc.spread_threshold*100:.1f}c edge)")
+            print(f"  Size              : {wc.spread_size} shares (max {wc.max_order_size})")
+            print(f"  Cooldown          : {wc.trade_cooldown_ms}ms after dual leg")
+        else:
+            print(f"  Execution         : {wc.execution_mode}")
+            print(f"  Size              : {wc.legacy_size} shares (max {wc.max_order_size})")
+            print(f"  Min entry         : {wc.min_entry_price*100:.0f}c")
         print(f"  Dry run           : {self.is_dry_run()}")
-        if wc.strategy == "momentum":
-            print(f"  Signal            : lookback={wc.lookback_secs}s "
-                  f"min_delta={wc.entry_min_delta*100:.3f}%")
         session = requests.Session()
         sec = wc.interval_seconds
         while True:
@@ -3831,8 +4144,7 @@ def create_dashboard(bots):
     layout.split_column(
         Layout(
             Panel(
-                f"[bold cyan]EMILIANO BOT — Momentum / Legacy Strategies | "
-                f"Binance Futures aggTrade[/bold cyan]\n"
+                f"[bold cyan]EMILIANO BOT — Spread Capture / Legacy[/bold cyan]\n"
                 f"Schedule ({_tz_label}): {_schedule_str}",
                 style="bold green", box=box.ROUNDED,
             ),
@@ -3868,17 +4180,25 @@ def create_dashboard(bots):
             display_status = f"COOLDOWN {rem // 60}m{rem % 60:02d}s"
 
         delta_pct = d.get("price_delta", 0.0)
-        mom_sig   = d.get("momentum_signal", "NEUTRAL")
-        if "BULL" in mom_sig:
-            ratio_text = f"[bold green]{mom_sig}[/bold green]"
-        elif "BEAR" in mom_sig:
-            ratio_text = f"[bold red]{mom_sig}[/bold red]"
-        elif mom_sig == "STALE":
-            ratio_text = f"[yellow]{mom_sig}[/yellow]"
+        if bot.worker_config.strategy == "spread_capture":
+            edge = d.get("spread_edge", 0.0)
+            comb = d.get("combined_bid_c", 0)
+            ratio_text = (
+                f"[cyan]edge {edge:.4f}[/cyan] "
+                f"(comb {comb}c / thr {bot.worker_config.spread_threshold:.3f})"
+            )
+            strategy_text = f" | caps={d.get('spread_captures', 0)}"
         else:
-            ratio_text = f"[white]{mom_sig} (Δ {delta_pct:+.3f}%)[/white]"
-
-        momentum_text = f" | {bot.worker_config.execution_mode}"
+            mom_sig = d.get("momentum_signal", "NEUTRAL")
+            if "BULL" in mom_sig:
+                ratio_text = f"[bold green]{mom_sig}[/bold green]"
+            elif "BEAR" in mom_sig:
+                ratio_text = f"[bold red]{mom_sig}[/bold red]"
+            elif mom_sig == "STALE":
+                ratio_text = f"[yellow]{mom_sig}[/yellow]"
+            else:
+                ratio_text = f"[white]{mom_sig} (Δ {delta_pct:+.3f}%)[/white]"
+            strategy_text = f" | {bot.worker_config.execution_mode}"
 
         # Card border color based on trade state
         if bot.trade_state == TradeState.FILLED:
@@ -3905,11 +4225,19 @@ def create_dashboard(bots):
                 f"[b]{bot.position_side} filled:[/] {bot.entry_price*100:.1f}c "
                 f"×{bot.position_size:.2f}"
             )
+        elif bot.worker_config.strategy == "spread_capture":
+            inv_y = d.get("yes_shares", 0)
+            inv_n = d.get("no_shares", 0)
+            bought_text = (
+                f"[dim]spread | size={bot.worker_config.spread_size} sh | "
+                f"edge>{bot.worker_config.spread_threshold:.3f} | "
+                f"inv Y{inv_y}/N{inv_n}[/dim]"
+            )
         else:
             bought_text = (
                 f"[dim]{bot.worker_config.strategy} | "
-                f"size={bot.worker_config.momentum_size} sh | "
-                f"Δ≥{bot.worker_config.entry_min_delta*100:.2f}%[/dim]"
+                f"size={bot.worker_config.legacy_size} sh | "
+                f"min≥{bot.worker_config.min_entry_price*100:.0f}c[/dim]"
             )
 
         cd_pnl_color = "red" if cd.get("cooldown_window_pnl", 0) < 0 else "green"
@@ -3924,7 +4252,7 @@ def create_dashboard(bots):
 {bought_text}
 [bold]ROI:[/] [{pnl_color}]+${pnl_dollars:.2f} ({pnl_pct:+.2f}%)[/{pnl_color}]
 [bold]Cooldown PnL:[/] [{cd_pnl_color}]${cd.get('cooldown_window_pnl', 0):+.2f}[/] (limit -${ASSET_MAX_CUMULATIVE_LOSS:.2f}){cd_blocked}
-[bold]Binance Imb:[/] {ratio_text} {momentum_text}
+[bold]Spread:[/] {ratio_text}{strategy_text}
 [bold]Outcome:[/] [bold {'green' if d.get('outcome') == 'YES' else 'red' if d.get('outcome') == 'NO' else 'white'}]{d.get('outcome', 'PENDING')}[/]"""
             ),
             title=f"{d.get('asset', 'UNKNOWN')} · {time_window}",
@@ -4114,10 +4442,15 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        print("🚀 Starting EmilianoBot — Momentum Mode...")
+        print("🚀 Starting EmilianoBot — Spread Capture Mode...")
         for wc in WORKER_CONFIGS:
-            print(f"   {wc.asset.upper()} {wc.window}: {wc.strategy} / {wc.execution_mode} "
-                  f"| size={wc.momentum_size} | dry_run={wc.dry_run}")
+            if wc.strategy == "spread_capture":
+                print(f"   {wc.asset.upper()} {wc.window}: {wc.strategy} "
+                      f"| edge>{wc.spread_threshold:.3f} | size={wc.spread_size} "
+                      f"| dry_run={wc.dry_run}")
+            else:
+                print(f"   {wc.asset.upper()} {wc.window}: {wc.strategy} / {wc.execution_mode} "
+                      f"| size={wc.legacy_size} | dry_run={wc.dry_run}")
         asyncio.run(main())
     except KeyboardInterrupt:
         console.print("\n[bold yellow]👋 EmilianoBot shutting down...[/bold yellow]")

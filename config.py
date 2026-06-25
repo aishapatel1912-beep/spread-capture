@@ -1,5 +1,5 @@
 """
-Centralized configuration: momentum JSON workers + .env secrets/globals.
+Centralized configuration: trading_config.json workers + .env secrets/globals.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ WINDOW_SECONDS: dict[str, int] = {"5m": 300}
 MIN_SHARES: int = 5
 
 ExecutionMode = Literal["single_taker", "gtc_at_ask", "single_maker", "dual_hybrid"]
-StrategyName = Literal["momentum", "legacy"]
+StrategyName = Literal["spread_capture", "legacy"]
 
 _ASSET_ALIASES: dict[str, str] = {
     "bitcoin": "btc",
@@ -75,6 +75,17 @@ def _parse_positive_float(name: str, value: Any, *, allow_null: bool = False) ->
     return v
 
 
+def _parse_spread_threshold(name: str, value: Any, default: float) -> float:
+    raw = value if value is not None else default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        _fatal(f"{name}={raw!r} is not a valid number.")
+    if v <= 0 or v >= 1 or v != v:
+        _fatal(f"{name} must be between 0 and 1 exclusive (got {raw!r}).")
+    return v
+
+
 def _parse_positive_int(name: str, value: Any) -> int:
     try:
         v = int(value)
@@ -82,6 +93,16 @@ def _parse_positive_int(name: str, value: Any) -> int:
         _fatal(f"{name}={value!r} is not a valid integer.")
     if v < MIN_SHARES:
         _fatal(f"{name} must be >= {MIN_SHARES} (got {value!r}).")
+    return v
+
+
+def _parse_cooldown_ms(name: str, value: Any, default: int) -> int:
+    try:
+        v = int(value if value is not None else default)
+    except (TypeError, ValueError):
+        _fatal(f"{name}={value!r} is not a valid integer.")
+    if v < 0:
+        _fatal(f"{name} must be >= 0 (got {value!r}).")
     return v
 
 
@@ -99,18 +120,20 @@ DRY_RUN_DEFAULT: bool = _parse_bool_env("DRY_RUN_DEFAULT", _parse_bool_env("DRY_
 class WorkerConfig:
     asset: str
     window: str
-    strategy: StrategyName = "momentum"
-    lookback_secs: float = 3.0
-    entry_min_delta: float = 0.0015
-    execution_mode: ExecutionMode = "single_taker"
-    momentum_size: int = 10
-    max_buy_order_size: int = 10
+    strategy: StrategyName = "spread_capture"
+    spread_threshold: float = 0.03
+    trade_cooldown_ms: int = 3000
+    spread_size: int = 10
+    max_order_size: int = 10
+    price_bias: float = 0.01
     dry_run: bool = DRY_RUN_DEFAULT
-    stop_loss_pct: float = 35.0
-    take_profit_pct: float = 35.0
     listener_activate_secs: int = 300
     entry_seconds_left: int = 300
     min_entry_price: float = 0.90
+    stop_loss_pct: float = 35.0
+    take_profit_pct: float = 35.0
+    legacy_size: int = 10
+    execution_mode: ExecutionMode = "gtc_at_ask"
     enabled: bool = True
 
     @property
@@ -138,32 +161,37 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
             f"Supported: {sorted(SUPPORTED_WINDOWS)}"
         )
 
-    strategy = str(raw.get("strategy", defaults.get("strategy", "momentum"))).lower()
-    if strategy not in ("momentum", "legacy"):
-        _fatal(f"Invalid strategy {strategy!r} for {asset}:{window}")
+    strategy = str(raw.get("strategy", defaults.get("strategy", "spread_capture"))).lower()
+    if strategy not in ("spread_capture", "legacy"):
+        _fatal(f"Invalid strategy {strategy!r} for {asset}:{window} (use spread_capture or legacy)")
 
-    exec_mode = str(raw.get("execution_mode", defaults.get("execution_mode", "single_taker")))
-    allowed_modes = ("single_taker", "gtc_at_ask", "single_maker", "dual_hybrid")
-    if exec_mode not in allowed_modes:
-        _fatal(f"Invalid execution_mode {exec_mode!r} for {asset}:{window}")
-
-    lookback = _parse_positive_float(
-        "lookback_secs", raw.get("lookback_secs", defaults.get("lookback_secs", 3.0))
+    spread_threshold = _parse_spread_threshold(
+        "spread_threshold",
+        raw.get("spread_threshold", defaults.get("spread_threshold")),
+        float(defaults.get("spread_threshold", 0.03)),
     )
-    entry_delta = _parse_positive_float(
-        "entry_min_delta", raw.get("entry_min_delta", defaults.get("entry_min_delta", 0.0015))
+    trade_cooldown_ms = _parse_cooldown_ms(
+        "trade_cooldown_ms",
+        raw.get("trade_cooldown_ms", defaults.get("trade_cooldown_ms")),
+        int(defaults.get("trade_cooldown_ms", 3000)),
     )
-    momentum_size = _parse_positive_int(
-        "momentum_size", raw.get("momentum_size", defaults.get("momentum_size", 10))
+    spread_size = _parse_positive_int(
+        "spread_size", raw.get("spread_size", defaults.get("spread_size", 10))
     )
-    max_buy = _parse_positive_int(
-        "max_buy_order_size", raw.get("max_buy_order_size", defaults.get("max_buy_order_size", 10))
+    max_order = _parse_positive_int(
+        "max_order_size", raw.get("max_order_size", defaults.get("max_order_size", 10))
     )
-    if momentum_size > max_buy:
+    if spread_size > max_order:
         _fatal(
-            f"{asset}:{window}: momentum_size ({momentum_size}) "
-            f"cannot exceed max_buy_order_size ({max_buy})"
+            f"{asset}:{window}: spread_size ({spread_size}) "
+            f"cannot exceed max_order_size ({max_order})"
         )
+
+    price_bias = _parse_spread_threshold(
+        "price_bias",
+        raw.get("price_bias", defaults.get("price_bias")),
+        float(defaults.get("price_bias", 0.01)),
+    )
 
     dr_raw = raw.get("dry_run", defaults.get("dry_run"))
     if dr_raw is None:
@@ -192,6 +220,19 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     sl = float(raw.get("stop_loss_pct", defaults.get("stop_loss_pct", 35)))
     tp = float(raw.get("take_profit_pct", defaults.get("take_profit_pct", 35)))
     min_entry = float(raw.get("min_entry_price", defaults.get("min_entry_price", 0.90)))
+    legacy_size = _parse_positive_int(
+        "legacy_size", raw.get("legacy_size", defaults.get("legacy_size", spread_size))
+    )
+    if legacy_size > max_order:
+        _fatal(
+            f"{asset}:{window}: legacy_size ({legacy_size}) "
+            f"cannot exceed max_order_size ({max_order})"
+        )
+
+    exec_mode = str(raw.get("execution_mode", defaults.get("execution_mode", "gtc_at_ask")))
+    allowed_modes = ("single_taker", "gtc_at_ask", "single_maker", "dual_hybrid")
+    if exec_mode not in allowed_modes:
+        _fatal(f"Invalid execution_mode {exec_mode!r} for {asset}:{window}")
 
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
@@ -201,25 +242,27 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         asset=asset,
         window=window,
         strategy=strategy,  # type: ignore[arg-type]
-        lookback_secs=float(lookback),
-        entry_min_delta=float(entry_delta),
-        execution_mode=exec_mode,  # type: ignore[arg-type]
-        momentum_size=momentum_size,
-        max_buy_order_size=max_buy,
+        spread_threshold=spread_threshold,
+        trade_cooldown_ms=trade_cooldown_ms,
+        spread_size=spread_size,
+        max_order_size=max_order,
+        price_bias=price_bias,
         dry_run=dry_run,
         stop_loss_pct=sl,
         take_profit_pct=tp,
         listener_activate_secs=listener_secs,
         entry_seconds_left=entry_secs,
         min_entry_price=min_entry,
+        legacy_size=legacy_size,
+        execution_mode=exec_mode,  # type: ignore[arg-type]
         enabled=enabled,
     )
 
 
 def load_worker_configs(path: Optional[str] = None) -> Tuple[WorkerConfig, ...]:
-    cfg_path = path or os.getenv("MOMENTUM_CONFIG_PATH", "momentum_config.json")
+    cfg_path = path or os.getenv("TRADING_CONFIG_PATH", "trading_config.json")
     if not os.path.isfile(cfg_path):
-        _fatal(f"Momentum config not found: {cfg_path}")
+        _fatal(f"Trading config not found: {cfg_path}")
 
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -251,7 +294,7 @@ def load_worker_configs(path: Optional[str] = None) -> Tuple[WorkerConfig, ...]:
         out.append(wc)
 
     if not out:
-        _fatal("No enabled workers in momentum config.")
+        _fatal("No enabled workers in trading config.")
 
     return tuple(out)
 

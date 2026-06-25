@@ -223,14 +223,6 @@ async def _initialize_bots():
                 print(f"⚠️  [trade-history] Non-fatal backfill error: {th_err}")
                 traceback.print_exc()
 
-        try:
-            from signals.binance_agg_trade import BinanceAggTradeSignal
-            from config import TRADING_ASSETS
-            await BinanceAggTradeSignal.warm_assets(TRADING_ASSETS)
-        except Exception as bf_err:
-            print(f"⚠️  [Binance feeds] Warm-up failed (non-fatal): {bf_err}")
-            traceback.print_exc()
-
         asyncio.create_task(run_all_bots())
         print("🎉 All bots started successfully!")
 
@@ -387,6 +379,10 @@ def get_global_stats() -> dict:
             total_wins   += getattr(bot, "wins",    0)
             total_losses += getattr(bot, "losses",  0)
             in_position   = getattr(bot, "trade_state", None) == TradeState.FILLED
+            if getattr(bot, "worker_config", None) and bot.worker_config.strategy == "spread_capture":
+                inv = getattr(bot, "spread_inventory", None)
+                if inv and (inv.yes_shares > 0 or inv.no_shares > 0):
+                    in_position = True
             if bot.active_market or in_position:
                 active_count += 1
             if in_position:
@@ -1531,7 +1527,10 @@ function renderCard(bot){
   const cdPnl=Number(bot.cooldown_window_pnl)||0;
   const cdPnlPos=cdPnl>=0;
   const border=inProfit?'border-l-4 border-emerald-500':inLoss?'border-l-4 border-red-500':inCooldown?'border-l-4 border-orange-500':hasPos?'border-l-4 border-sky-500':'';
-  const signal=bot.momentum_signal||'NEUTRAL';
+  const isSpread=(bot.strategy||'')==='spread_capture';
+  const signal=isSpread
+    ?((bot.spread_edge||0)>(bot.spread_threshold||0.03)?`EDGE ${(bot.spread_edge||0).toFixed(4)}`:'NO EDGE')
+    :(bot.momentum_signal||'NEUTRAL');
   const stale=!!bot.signal_stale;
   const wins=bot.wins??0;const losses=bot.losses??0;
   const trades=bot.trade_count??0;const wr=bot.win_rate??0;
@@ -1572,16 +1571,31 @@ function renderCard(bot){
           <div class="text-lg font-bold text-red-400 font-mono" style="font-variant-numeric:tabular-nums;">${_displayYesNoPrice(bot.no||0)}</div>
         </div>
       </div>
+      ${isSpread?`
+      <div class="bg-zinc-800 rounded-xl px-3 py-2 mb-3 flex items-center justify-between gap-2 flex-wrap">
+        <span class="inline-flex items-center gap-1.5 text-sm font-semibold px-2.5 py-1 rounded-full ${pillClass(signal)}">
+          ${sigIcon(signal)} ${signal}
+        </span>
+        <div class="text-xs text-zinc-400 font-mono">
+          bids <span class="text-cyan-400">${bot.combined_bid_c||0}c</span>
+          &nbsp;· thr ${((bot.spread_threshold||0.03)*100).toFixed(1)}c
+          &nbsp;· caps ${bot.spread_captures||0}
+        </div>
+      </div>
+      <div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-xs font-mono text-zinc-300 flex justify-between">
+        <span>YES sh: ${(bot.yes_shares||0).toFixed(1)}</span>
+        <span>NO sh: ${(bot.no_shares||0).toFixed(1)}</span>
+        <span>imb: ${(bot.spread_imbalance||0).toFixed(1)}</span>
+      </div>`:`
       <div class="bg-zinc-800 rounded-xl px-3 py-2 mb-3 flex items-center justify-between gap-2 flex-wrap">
         <span class="inline-flex items-center gap-1.5 text-sm font-semibold px-2.5 py-1 rounded-full ${pillClass(signal)}">
           ${sigIcon(signal)} ${signal}${stale ? ' · STALE' : ''}
         </span>
         <div class="text-xs text-zinc-400 font-mono">
           Δ <span class="${sigClass(signal)}">${(bot.price_delta_pct||0).toFixed(3)}%</span>
-          &nbsp;· ${bot.execution_mode||'single_taker'}
-          &nbsp;· lb ${bot.lookback_secs||'?'}s
+          &nbsp;· ${bot.execution_mode||'gtc_at_ask'}
         </div>
-      </div>
+      </div>`}
       <div class="space-y-1.5 text-sm mb-3">
         <div class="flex items-center justify-between">
           <span class="text-zinc-400">Position</span>
