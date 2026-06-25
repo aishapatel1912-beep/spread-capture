@@ -2326,6 +2326,9 @@ class MarketWorker:
             "yes_shares":         0.0,
             "no_shares":          0.0,
             "spread_imbalance":   0.0,
+            "yes_avg_price_c":    0.0,
+            "no_avg_price_c":     0.0,
+            "pair_avg_price_c":   0.0,
         }
         self.recent_logs: Deque[str] = deque(maxlen=4)
 
@@ -2520,6 +2523,16 @@ class MarketWorker:
         self.dashboard["yes_shares"] = round(inv.yes_shares, 2)
         self.dashboard["no_shares"] = round(inv.no_shares, 2)
         self.dashboard["spread_imbalance"] = round(inv.imbalance, 2)
+        yes_avg = inv.avg_cost("YES")
+        no_avg = inv.avg_cost("NO")
+        self.dashboard["yes_avg_price"] = round(yes_avg, 4)
+        self.dashboard["no_avg_price"] = round(no_avg, 4)
+        self.dashboard["yes_avg_price_c"] = round(yes_avg * 100, 1) if inv.yes_shares > 0 else 0.0
+        self.dashboard["no_avg_price_c"] = round(no_avg * 100, 1) if inv.no_shares > 0 else 0.0
+        if inv.yes_shares > 0 and inv.no_shares > 0:
+            self.dashboard["pair_avg_price_c"] = round((yes_avg + no_avg) * 100, 1)
+        else:
+            self.dashboard["pair_avg_price_c"] = 0.0
         if inv.yes_shares > 0 or inv.no_shares > 0:
             self.dashboard["status"] = (
                 f"SPREAD Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f}"
@@ -2984,6 +2997,12 @@ class MarketWorker:
                        or f"{self.asset_type.upper()} Up or Down")
         pnl_dollars, pnl_pct = self.get_spread_unrealized_pnl()
         total_cost = inv.yes_cost + inv.no_cost
+        yes_avg_c = round(inv.avg_cost("YES") * 100, 1) if inv.yes_shares > 0 else 0.0
+        no_avg_c = round(inv.avg_cost("NO") * 100, 1) if inv.no_shares > 0 else 0.0
+        pair_avg_c = (
+            round((inv.avg_cost("YES") + inv.avg_cost("NO")) * 100, 1)
+            if inv.matched_pairs > 0 else 0.0
+        )
         return {
             "id":                  f"{self.asset_type}:{self.window_slug}:{slug}:spread",
             "asset":               self.asset_type.upper(),
@@ -2994,12 +3013,16 @@ class MarketWorker:
             "strategy":            "spread_capture",
             "yes_shares":          round(inv.yes_shares, 4),
             "no_shares":           round(inv.no_shares, 4),
+            "yes_avg_price_c":     yes_avg_c,
+            "no_avg_price_c":      no_avg_c,
+            "pair_avg_price_c":    pair_avg_c,
             "matched_pairs":       round(inv.matched_pairs, 4),
             "spread_imbalance":    round(inv.imbalance, 4),
-            "entry_price":         0.0,
+            "entry_price":         round(inv.avg_cost("YES") + inv.avg_cost("NO"), 4)
+                                   if inv.matched_pairs > 0 else 0.0,
             "current_price":       0.0,
-            "entry_price_cents":   0.0,
-            "current_price_cents": 0.0,
+            "entry_price_cents":   pair_avg_c,
+            "current_price_cents": 100.0 if inv.matched_pairs > 0 else 0.0,
             "roi_pct":             pnl_pct,
             "unrealized_pnl":      pnl_dollars,
             "size":                round(inv.yes_shares + inv.no_shares, 4),
@@ -3042,6 +3065,11 @@ class MarketWorker:
         self.dashboard["yes_shares"]        = 0.0
         self.dashboard["no_shares"]         = 0.0
         self.dashboard["spread_imbalance"]  = 0.0
+        self.dashboard["yes_avg_price"]     = 0.0
+        self.dashboard["no_avg_price"]      = 0.0
+        self.dashboard["yes_avg_price_c"]   = 0.0
+        self.dashboard["no_avg_price_c"]    = 0.0
+        self.dashboard["pair_avg_price_c"]  = 0.0
         self.spread_state = SpreadState.IDLE
         self.spread_inventory.reset()
         self.spread_captures = 0
@@ -3153,10 +3181,20 @@ class MarketWorker:
         inv = self.spread_inventory
 
         if inv.yes_shares > 0 or inv.no_shares > 0:
-            position_text = (
-                f"Y{inv.yes_shares:.1f}/N{inv.no_shares:.1f} "
-                f"(±{inv.imbalance:.1f}) caps={self.spread_captures}"
-            )
+            leg_parts: List[str] = []
+            if inv.yes_shares > 0:
+                leg_parts.append(
+                    f"Y{inv.yes_shares:.1f}@{round(inv.avg_cost('YES') * 100)}c"
+                )
+            if inv.no_shares > 0:
+                leg_parts.append(
+                    f"N{inv.no_shares:.1f}@{round(inv.avg_cost('NO') * 100)}c"
+                )
+            position_text = " · ".join(leg_parts)
+            if inv.yes_shares > 0 and inv.no_shares > 0:
+                position_text += (
+                    f" (pair={round((inv.avg_cost('YES') + inv.avg_cost('NO')) * 100)}c)"
+                )
         else:
             position_text = "-"
 
@@ -3197,6 +3235,11 @@ class MarketWorker:
             "max_shares":         self.worker_config.max_shares,
             "yes_shares":         self.dashboard.get("yes_shares", 0.0),
             "no_shares":          self.dashboard.get("no_shares", 0.0),
+            "yes_avg_price":      self.dashboard.get("yes_avg_price", 0.0),
+            "no_avg_price":       self.dashboard.get("no_avg_price", 0.0),
+            "yes_avg_price_c":    self.dashboard.get("yes_avg_price_c", 0.0),
+            "no_avg_price_c":     self.dashboard.get("no_avg_price_c", 0.0),
+            "pair_avg_price_c":   self.dashboard.get("pair_avg_price_c", 0.0),
             "spread_imbalance":   self.dashboard.get("spread_imbalance", 0.0),
             "spread_captures":    self.spread_captures,
             "spread_state":       spread_status,
@@ -3488,10 +3531,13 @@ def create_dashboard(bots):
         else:
             time_window = "Waiting for market..."
 
+        y_avg = d.get("yes_avg_price_c", 0)
+        n_avg = d.get("no_avg_price_c", 0)
         bought_text = (
-            f"[dim]spread | order={bot.worker_config.spread_size} sh | "
-            f"max={bot.worker_config.max_shares} sh/leg | "
-            f"inv Y{inv_y}/N{inv_n}[/dim]"
+            f"[dim]spread | "
+            + (f"Y{inv_y}@{y_avg}c " if inv_y > 0 else "")
+            + (f"N{inv_n}@{n_avg}c " if inv_n > 0 else "")
+            + f"| max={bot.worker_config.max_shares}/leg[/dim]"
         )
 
         cd_pnl_color = "red" if cd.get("cooldown_window_pnl", 0) < 0 else "green"

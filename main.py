@@ -1306,15 +1306,18 @@ function renderPositions(positions) {
     const cashoutKey = `${p.asset}:${p.window}`;
     const disabled = pending || !p.cashout_available;
     const btnLabel = pending ? 'Selling…' : 'Sell';
-    const sideCls = p.side === 'YES' ? 'pm-side-yes' : 'pm-side-no';
+    const sideCls = p.side === 'YES' ? 'pm-side-yes' : p.side === 'NO' ? 'pm-side-no' : 'pm-side-spread';
+    const isSpread = p.side === 'SPREAD';
+    const entryDetail = isSpread
+      ? `<span>Y ${Number(p.yes_shares||0).toFixed(1)}@${_fmtCents(p.yes_avg_price_c)} · N ${Number(p.no_shares||0).toFixed(1)}@${_fmtCents(p.no_avg_price_c)}${p.pair_avg_price_c ? ' · pair '+_fmtCents(p.pair_avg_price_c) : ''}</span>`
+      : `<span class="${sideCls}">${p.side}</span><span>${_fmtCents(p.entry_price_cents)} → ${_fmtCents(p.current_price_cents)}</span>`;
     return `
       <div class="pm-row" data-asset="${p.asset}" data-window="${p.window || '5m'}">
         <div class="pm-row-main">
           <div class="pm-row-title">${_shortMarket(p.market)}</div>
           <div class="pm-row-sub">
             <span>${p.asset} ${p.window || '5m'}</span>
-            <span class="${sideCls}">${p.side}</span>
-            <span>${_fmtCents(p.entry_price_cents)} → ${_fmtCents(p.current_price_cents)}</span>
+            ${entryDetail}
             <span>${Number(p.size).toFixed(2)} sh</span>
           </div>
         </div>
@@ -1322,8 +1325,8 @@ function renderPositions(positions) {
           <span class="pm-row-val ${roiCls}">${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%</span>
           <span class="pm-row-meta ${roiCls}">${_fmtUsd(pnl, true)}</span>
         </div>
-        <button class="pm-cashout-btn" ${disabled ? 'disabled' : ''}
-                onclick="cashoutPosition('${p.asset}','${p.window || '5m'}')">${btnLabel}</button>
+        ${isSpread ? '' : `<button class="pm-cashout-btn" ${disabled ? 'disabled' : ''}
+                onclick="cashoutPosition('${p.asset}','${p.window || '5m'}')">${btnLabel}</button>`}
       </div>`;
   }).join('');
 }
@@ -1532,6 +1535,15 @@ function renderCard(bot){
   const thrCents=(bot.spread_threshold_cents!=null)?bot.spread_threshold_cents:((bot.spread_threshold||0.03)*100);
   const edgeOk=!!bot.edge_above_threshold;
   const signal=edgeOk?`EDGE ${edgeCents.toFixed(2)}c`:'NO EDGE';
+  const yesAvgC=(bot.yes_shares||0)>0?(bot.yes_avg_price_c||0):null;
+  const noAvgC=(bot.no_shares||0)>0?(bot.no_avg_price_c||0):null;
+  const yesShLabel=(bot.yes_shares||0)>0
+    ?`YES ${(bot.yes_shares||0).toFixed(1)} sh @ ${yesAvgC.toFixed(1)}c`
+    :`YES 0 / ${(bot.max_shares||'?')}`;
+  const noShLabel=(bot.no_shares||0)>0
+    ?`NO ${(bot.no_shares||0).toFixed(1)} sh @ ${noAvgC.toFixed(1)}c`
+    :`NO 0 / ${(bot.max_shares||'?')}`;
+  const pairAvgC=(bot.pair_avg_price_c||0)>0?bot.pair_avg_price_c:null;
   const wins=bot.wins??0;const losses=bot.losses??0;
   const trades=bot.trade_count??0;const wr=bot.win_rate??0;
   const mw=formatMarketWindow(bot.market_start_iso,bot.market_end_iso);
@@ -1583,9 +1595,9 @@ function renderCard(bot){
       <div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-xs font-mono text-zinc-300 grid grid-cols-2 gap-x-3 gap-y-1">
         <span>bids: ${bot.combined_bid_c||0}c</span>
         <span>caps: ${bot.spread_captures||0}</span>
-        <span>YES sh: ${(bot.yes_shares||0).toFixed(1)} / ${(bot.max_shares||'?')}</span>
-        <span>NO sh: ${(bot.no_shares||0).toFixed(1)} / ${(bot.max_shares||'?')}</span>
-        <span class="col-span-2">imb: ${(bot.spread_imbalance||0).toFixed(1)}</span>
+        <span>${yesShLabel}</span>
+        <span>${noShLabel}</span>
+        <span class="col-span-2">${pairAvgC!=null?`pair avg: ${pairAvgC.toFixed(1)}c · `:''}imb: ${(bot.spread_imbalance||0).toFixed(1)} · caps: ${bot.spread_captures||0}</span>
       </div>
       <div class="space-y-1.5 text-sm mb-3">
         <div class="flex items-center justify-between">
