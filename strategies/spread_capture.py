@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from strategies.base import SpreadDecision
 from strategies.spread_execution import execute_spread_decision
@@ -31,11 +31,12 @@ class SpreadCaptureStrategy:
         if edge <= cfg.spread_threshold:
             return None
 
-        size = worker.spread_order_size()
+        under = worker.spread_inventory.underweight_side()
+        legs: List[str] = ["YES", "NO"] if under is None else [under]
+        size = worker.spread_order_size(legs)
         if size is None:
             return None
 
-        under = worker.spread_inventory.underweight_side()
         if under is None:
             return SpreadDecision(
                 yes_price=round(up_bid, 2),

@@ -364,8 +364,6 @@ def get_global_stats() -> dict:
             "asset_cooldown_minutes": ASSET_COOLDOWN_MINUTES,
         }
 
-    from bot import TradeState  # local import to avoid circular issues
-
     total_pnl       = 0.0
     active_count    = 0
     total_wins      = 0
@@ -378,11 +376,13 @@ def get_global_stats() -> dict:
             total_pnl    += getattr(bot, "cumulative_pnl", 0.0)
             total_wins   += getattr(bot, "wins",    0)
             total_losses += getattr(bot, "losses",  0)
-            in_position   = getattr(bot, "trade_state", None) == TradeState.FILLED
-            if getattr(bot, "worker_config", None) and bot.worker_config.strategy == "spread_capture":
-                inv = getattr(bot, "spread_inventory", None)
-                if inv and (inv.yes_shares > 0 or inv.no_shares > 0):
-                    in_position = True
+            in_position = (
+                getattr(bot, "spread_inventory", None) is not None
+                and (
+                    bot.spread_inventory.yes_shares > 0
+                    or bot.spread_inventory.no_shares > 0
+                )
+            )
             if bot.active_market or in_position:
                 active_count += 1
             if in_position:
@@ -1518,20 +1518,20 @@ function _fmtCooldownRemaining(sec) {
 }
 
 function renderCard(bot){
-  const hasPos=bot.position&&bot.position!=='-';
+  const hasInv=(bot.yes_shares||0)>0||(bot.no_shares||0)>0;
+  const hasPos=(bot.position&&bot.position!=='-')||hasInv;
   const pnlPos=(bot.pnl_dollars||0)>=0;
   const cumPos=(bot.cumulative_pnl||0)>=0;
-  const inProfit=hasPos&&(bot.pnl_dollars||0)>0;
-  const inLoss=hasPos&&(bot.pnl_dollars||0)<0;
+  const inProfit=hasInv&&(bot.pnl_dollars||0)>0;
+  const inLoss=hasInv&&(bot.pnl_dollars||0)<0;
   const inCooldown=!!bot.cooldown_active;
   const cdPnl=Number(bot.cooldown_window_pnl)||0;
   const cdPnlPos=cdPnl>=0;
   const border=inProfit?'border-l-4 border-emerald-500':inLoss?'border-l-4 border-red-500':inCooldown?'border-l-4 border-orange-500':hasPos?'border-l-4 border-sky-500':'';
-  const isSpread=(bot.strategy||'')==='spread_capture';
-  const signal=isSpread
-    ?((bot.spread_edge||0)>(bot.spread_threshold||0.03)?`EDGE ${(bot.spread_edge||0).toFixed(4)}`:'NO EDGE')
-    :(bot.momentum_signal||'NEUTRAL');
-  const stale=!!bot.signal_stale;
+  const edgeCents=(bot.spread_edge_cents!=null)?bot.spread_edge_cents:((bot.spread_edge||0)*100);
+  const thrCents=(bot.spread_threshold_cents!=null)?bot.spread_threshold_cents:((bot.spread_threshold||0.03)*100);
+  const edgeOk=!!bot.edge_above_threshold;
+  const signal=edgeOk?`EDGE ${edgeCents.toFixed(2)}c`:'NO EDGE';
   const wins=bot.wins??0;const losses=bot.losses??0;
   const trades=bot.trade_count??0;const wr=bot.win_rate??0;
   const mw=formatMarketWindow(bot.market_start_iso,bot.market_end_iso);
@@ -1571,31 +1571,22 @@ function renderCard(bot){
           <div class="text-lg font-bold text-red-400 font-mono" style="font-variant-numeric:tabular-nums;">${_displayYesNoPrice(bot.no||0)}</div>
         </div>
       </div>
-      ${isSpread?`
       <div class="bg-zinc-800 rounded-xl px-3 py-2 mb-3 flex items-center justify-between gap-2 flex-wrap">
         <span class="inline-flex items-center gap-1.5 text-sm font-semibold px-2.5 py-1 rounded-full ${pillClass(signal)}">
           ${sigIcon(signal)} ${signal}
         </span>
         <div class="text-xs text-zinc-400 font-mono">
-          bids <span class="text-cyan-400">${bot.combined_bid_c||0}c</span>
-          &nbsp;· thr ${((bot.spread_threshold||0.03)*100).toFixed(1)}c
-          &nbsp;· caps ${bot.spread_captures||0}
+          live edge <span class="${edgeOk?'text-emerald-400':'text-zinc-300'}">${edgeCents.toFixed(2)}c</span>
+          &nbsp;· need <span class="text-cyan-400">&gt;${thrCents.toFixed(1)}c</span>
         </div>
       </div>
-      <div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-xs font-mono text-zinc-300 flex justify-between">
-        <span>YES sh: ${(bot.yes_shares||0).toFixed(1)}</span>
-        <span>NO sh: ${(bot.no_shares||0).toFixed(1)}</span>
-        <span>imb: ${(bot.spread_imbalance||0).toFixed(1)}</span>
-      </div>`:`
-      <div class="bg-zinc-800 rounded-xl px-3 py-2 mb-3 flex items-center justify-between gap-2 flex-wrap">
-        <span class="inline-flex items-center gap-1.5 text-sm font-semibold px-2.5 py-1 rounded-full ${pillClass(signal)}">
-          ${sigIcon(signal)} ${signal}${stale ? ' · STALE' : ''}
-        </span>
-        <div class="text-xs text-zinc-400 font-mono">
-          Δ <span class="${sigClass(signal)}">${(bot.price_delta_pct||0).toFixed(3)}%</span>
-          &nbsp;· ${bot.execution_mode||'gtc_at_ask'}
-        </div>
-      </div>`}
+      <div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-xs font-mono text-zinc-300 grid grid-cols-2 gap-x-3 gap-y-1">
+        <span>bids: ${bot.combined_bid_c||0}c</span>
+        <span>caps: ${bot.spread_captures||0}</span>
+        <span>YES sh: ${(bot.yes_shares||0).toFixed(1)} / ${(bot.max_shares||'?')}</span>
+        <span>NO sh: ${(bot.no_shares||0).toFixed(1)} / ${(bot.max_shares||'?')}</span>
+        <span class="col-span-2">imb: ${(bot.spread_imbalance||0).toFixed(1)}</span>
+      </div>
       <div class="space-y-1.5 text-sm mb-3">
         <div class="flex items-center justify-between">
           <span class="text-zinc-400">Position</span>
@@ -1707,42 +1698,18 @@ async def api_trades_history(limit: int = 10):
 
 @app.post("/api/positions/{asset}/{window}/cashout")
 async def api_cashout(asset: str, window: str):
-    """
-    Manual dashboard cashout — delegates to MarketWorker.manual_cashout()
-    which uses the same _close_open_position() path as TP/SL exits.
-    """
-    if not bots:
-        raise HTTPException(status_code=503, detail="Bots not initialized")
-    worker = find_worker(bots, asset, window)
-    if worker is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No bot for {asset!r} {window!r}",
-        )
-    try:
-        result = await worker.manual_cashout()
-        status = 200 if result.get("ok") else 409
-        return JSONResponse(result, status_code=status)
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    raise HTTPException(
+        status_code=410,
+        detail="Manual cashout removed — spread capture settles at market expiry",
+    )
 
 
 @app.post("/api/positions/{asset}/cashout")
 async def api_cashout_legacy(asset: str):
-    """Legacy cashout route — first matching worker for asset (5m only deployments)."""
-    if not bots:
-        raise HTTPException(status_code=503, detail="Bots not initialized")
-    worker = find_worker_by_asset(bots, asset)
-    if worker is None:
-        raise HTTPException(status_code=404, detail=f"No bot for asset {asset!r}")
-    try:
-        result = await worker.manual_cashout()
-        status = 200 if result.get("ok") else 409
-        return JSONResponse(result, status_code=status)
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    raise HTTPException(
+        status_code=410,
+        detail="Manual cashout removed — spread capture settles at market expiry",
+    )
 
 
 if __name__ == "__main__":

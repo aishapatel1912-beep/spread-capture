@@ -1,10 +1,4 @@
-from strategies.base import EntryDecision, SpreadDecision
-from strategies.legacy import LegacyStrategy
+from strategies.base import SpreadDecision
 from strategies.spread_capture import SpreadCaptureStrategy
 
-__all__ = [
-    "EntryDecision",
-    "SpreadDecision",
-    "LegacyStrategy",
-    "SpreadCaptureStrategy",
-]
+__all__ = ["SpreadDecision", "SpreadCaptureStrategy"]

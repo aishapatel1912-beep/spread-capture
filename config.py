@@ -8,7 +8,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -20,9 +20,6 @@ SUPPORTED_TRADING_ASSETS: frozenset[str] = frozenset(
 SUPPORTED_WINDOWS: frozenset[str] = frozenset({"5m"})
 WINDOW_SECONDS: dict[str, int] = {"5m": 300}
 MIN_SHARES: int = 5
-
-ExecutionMode = Literal["single_taker", "gtc_at_ask", "single_maker", "dual_hybrid"]
-StrategyName = Literal["spread_capture", "legacy"]
 
 _ASSET_ALIASES: dict[str, str] = {
     "bitcoin": "btc",
@@ -51,28 +48,8 @@ def normalize_window(raw: str) -> str:
     return w
 
 
-def binance_spot_symbol(asset: str) -> str:
-    return normalize_asset_slug(asset).split("-")[0].upper()
-
-
-def binance_futures_symbol(asset: str) -> str:
-    return binance_spot_symbol(asset)
-
-
 def worker_key(asset: str, window: str) -> str:
     return f"{normalize_asset_slug(asset)}:{normalize_window(window)}"
-
-
-def _parse_positive_float(name: str, value: Any, *, allow_null: bool = False) -> Optional[float]:
-    if value is None:
-        return None if allow_null else _fatal(f"{name} is required.")
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        _fatal(f"{name}={value!r} is not a valid number.")
-    if v <= 0 or not (v == v) or v in (float("inf"), float("-inf")):
-        _fatal(f"{name} must be a positive number (got {value!r}).")
-    return v
 
 
 def _parse_spread_threshold(name: str, value: Any, default: float) -> float:
@@ -93,6 +70,17 @@ def _parse_positive_int(name: str, value: Any) -> int:
         _fatal(f"{name}={value!r} is not a valid integer.")
     if v < MIN_SHARES:
         _fatal(f"{name} must be >= {MIN_SHARES} (got {value!r}).")
+    return v
+
+
+def _parse_max_shares(name: str, value: Any, default: float) -> float:
+    raw = value if value is not None else default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        _fatal(f"{name}={raw!r} is not a valid number.")
+    if v < MIN_SHARES or v != v or v in (float("inf"), float("-inf")):
+        _fatal(f"{name} must be >= {MIN_SHARES} (got {raw!r}).")
     return v
 
 
@@ -120,20 +108,17 @@ DRY_RUN_DEFAULT: bool = _parse_bool_env("DRY_RUN_DEFAULT", _parse_bool_env("DRY_
 class WorkerConfig:
     asset: str
     window: str
-    strategy: StrategyName = "spread_capture"
     spread_threshold: float = 0.03
     trade_cooldown_ms: int = 3000
     spread_size: int = 10
     max_order_size: int = 10
+    max_shares: float = 10.2
     price_bias: float = 0.01
     dry_run: bool = DRY_RUN_DEFAULT
+    dry_run_fill_delay_min_ms: int = 200
+    dry_run_fill_delay_max_ms: int = 2500
     listener_activate_secs: int = 300
     entry_seconds_left: int = 300
-    min_entry_price: float = 0.90
-    stop_loss_pct: float = 35.0
-    take_profit_pct: float = 35.0
-    legacy_size: int = 10
-    execution_mode: ExecutionMode = "gtc_at_ask"
     enabled: bool = True
 
     @property
@@ -161,10 +146,6 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
             f"Supported: {sorted(SUPPORTED_WINDOWS)}"
         )
 
-    strategy = str(raw.get("strategy", defaults.get("strategy", "spread_capture"))).lower()
-    if strategy not in ("spread_capture", "legacy"):
-        _fatal(f"Invalid strategy {strategy!r} for {asset}:{window} (use spread_capture or legacy)")
-
     spread_threshold = _parse_spread_threshold(
         "spread_threshold",
         raw.get("spread_threshold", defaults.get("spread_threshold")),
@@ -181,10 +162,20 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     max_order = _parse_positive_int(
         "max_order_size", raw.get("max_order_size", defaults.get("max_order_size", 10))
     )
+    max_shares = _parse_max_shares(
+        "max_shares",
+        raw.get("max_shares", defaults.get("max_shares")),
+        float(defaults.get("max_shares", 10.2)),
+    )
     if spread_size > max_order:
         _fatal(
             f"{asset}:{window}: spread_size ({spread_size}) "
             f"cannot exceed max_order_size ({max_order})"
+        )
+    if max_order > max_shares:
+        _fatal(
+            f"{asset}:{window}: max_order_size ({max_order}) "
+            f"cannot exceed max_shares ({max_shares})"
         )
 
     price_bias = _parse_spread_threshold(
@@ -198,6 +189,19 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         dry_run = DRY_RUN_DEFAULT
     else:
         dry_run = bool(dr_raw)
+
+    dry_min = _parse_cooldown_ms(
+        "dry_run_fill_delay_min_ms",
+        raw.get("dry_run_fill_delay_min_ms", defaults.get("dry_run_fill_delay_min_ms")),
+        int(defaults.get("dry_run_fill_delay_min_ms", 200)),
+    )
+    dry_max = _parse_cooldown_ms(
+        "dry_run_fill_delay_max_ms",
+        raw.get("dry_run_fill_delay_max_ms", defaults.get("dry_run_fill_delay_max_ms")),
+        int(defaults.get("dry_run_fill_delay_max_ms", 2500)),
+    )
+    if dry_max < dry_min:
+        _fatal(f"{asset}:{window}: dry_run_fill_delay_max_ms must be >= dry_run_fill_delay_min_ms")
 
     interval = WINDOW_SECONDS[window]
     listener_raw = raw.get("listener_activate_secs", defaults.get("listener_activate_secs"))
@@ -217,23 +221,6 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     else:
         entry_secs = interval
 
-    sl = float(raw.get("stop_loss_pct", defaults.get("stop_loss_pct", 35)))
-    tp = float(raw.get("take_profit_pct", defaults.get("take_profit_pct", 35)))
-    min_entry = float(raw.get("min_entry_price", defaults.get("min_entry_price", 0.90)))
-    legacy_size = _parse_positive_int(
-        "legacy_size", raw.get("legacy_size", defaults.get("legacy_size", spread_size))
-    )
-    if legacy_size > max_order:
-        _fatal(
-            f"{asset}:{window}: legacy_size ({legacy_size}) "
-            f"cannot exceed max_order_size ({max_order})"
-        )
-
-    exec_mode = str(raw.get("execution_mode", defaults.get("execution_mode", "gtc_at_ask")))
-    allowed_modes = ("single_taker", "gtc_at_ask", "single_maker", "dual_hybrid")
-    if exec_mode not in allowed_modes:
-        _fatal(f"Invalid execution_mode {exec_mode!r} for {asset}:{window}")
-
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         enabled = str(enabled).lower() in ("1", "true", "yes", "on")
@@ -241,20 +228,17 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     return WorkerConfig(
         asset=asset,
         window=window,
-        strategy=strategy,  # type: ignore[arg-type]
         spread_threshold=spread_threshold,
         trade_cooldown_ms=trade_cooldown_ms,
         spread_size=spread_size,
         max_order_size=max_order,
+        max_shares=max_shares,
         price_bias=price_bias,
         dry_run=dry_run,
-        stop_loss_pct=sl,
-        take_profit_pct=tp,
+        dry_run_fill_delay_min_ms=dry_min,
+        dry_run_fill_delay_max_ms=dry_max,
         listener_activate_secs=listener_secs,
         entry_seconds_left=entry_secs,
-        min_entry_price=min_entry,
-        legacy_size=legacy_size,
-        execution_mode=exec_mode,  # type: ignore[arg-type]
         enabled=enabled,
     )
 

@@ -1,4 +1,4 @@
-"""Strategy protocol for MarketWorker entry logic."""
+"""Strategy protocol for spread capture."""
 
 from __future__ import annotations
 
@@ -15,18 +15,10 @@ SpreadMode = Literal["dual", "rebalance"]
 class SpreadDecision:
     yes_price: float
     no_price: float
-    size: int
+    size: float
     edge: float
     mode: SpreadMode = "dual"
     rebalance_side: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class EntryDecision:
-    side: str
-    price: float
-    execution_mode: str
-    size: int
 
 
 class SpreadStrategyProtocol(Protocol):
@@ -34,12 +26,4 @@ class SpreadStrategyProtocol(Protocol):
         ...
 
     async def execute(self, worker: "MarketWorker", decision: SpreadDecision) -> None:
-        ...
-
-
-class LegacyStrategyProtocol(Protocol):
-    async def evaluate(self, worker: "MarketWorker") -> Optional[EntryDecision]:
-        ...
-
-    async def execute(self, worker: "MarketWorker", decision: EntryDecision) -> None:
         ...

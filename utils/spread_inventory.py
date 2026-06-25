@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -12,6 +12,12 @@ class SpreadInventory:
     no_shares: float = 0.0
     yes_cost: float = 0.0
     no_cost: float = 0.0
+
+    def shares(self, side: str) -> float:
+        return self.yes_shares if side == "YES" else self.no_shares
+
+    def headroom(self, side: str, max_shares: float) -> float:
+        return max(0.0, max_shares - self.shares(side))
 
     def record_buy(self, side: str, shares: float, price: float) -> None:
         if shares <= 0 or price <= 0:

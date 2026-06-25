@@ -43,14 +43,11 @@ from config import (
     WORKER_CONFIGS,
     WorkerConfig,
     asset_pnl_filename,
-    binance_futures_symbol,
-    binance_spot_symbol,
     validate_asset_cooldown_config,
     validate_trading_assets,
     worker_key,
 )
-from strategies.base import EntryDecision, SpreadDecision
-from strategies.legacy import LegacyStrategy
+from strategies.base import SpreadDecision
 from strategies.spread_capture import SpreadCaptureStrategy
 from utils.spread_inventory import SpreadInventory
 from utils.clob_helpers import clamp_buy_price, clamp_sell_price, parse_order_type
@@ -2321,14 +2318,7 @@ class MarketWorker:
             "timer":              "--:--",
             "listener":           "--:--",
             "status":             "WAITING",
-            "bought_side":        "-",
-            "entry_price":        0.0,
             "outcome":            "PENDING",
-            "profit":             0.0,
-            "price_delta":        0.0,
-            "signal_stale":       True,
-            "execution_mode":     worker_config.execution_mode,
-            "strategy":           worker_config.strategy,
             "combined_bid_c":     0,
             "spread_edge":        0.0,
             "yes_bid_c":          0,
@@ -2343,10 +2333,7 @@ class MarketWorker:
         self._cashout_in_progress: bool = False
         self._history_exit_action: str = "sell"
 
-        if worker_config.strategy == "legacy":
-            self.strategy = LegacyStrategy()
-        else:
-            self.strategy = SpreadCaptureStrategy()
+        self.strategy = SpreadCaptureStrategy()
 
         _register_worker(self)
 
@@ -2452,10 +2439,12 @@ class MarketWorker:
         self.recent_logs.append(f"[{timestamp}] {message}")
 
     def update_dashboard(self):
-        self.dashboard["bought_side"] = self.position_side or "-"
-        self.dashboard["entry_price"] = self.entry_price
-        if self.market_outcome:
-            self.dashboard["outcome"] = self.market_outcome
+        inv = self.spread_inventory
+        self.dashboard["outcome"] = self.market_outcome or "PENDING"
+        if inv.yes_shares > 0 or inv.no_shares > 0:
+            self.dashboard["status"] = (
+                f"SPREAD Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f}"
+            )
 
     def get_listener_countdown(self) -> str:
         if not self.active_market:
@@ -2473,18 +2462,50 @@ class MarketWorker:
     def is_dry_run(self) -> bool:
         return self.worker_config.dry_run
 
-    def spread_order_size(self) -> Optional[int]:
-        size = min(self.worker_config.spread_size, self.worker_config.max_order_size)
-        if size < MIN_SHARES:
-            return None
-        return size
-
-    def order_size_shares(self) -> Optional[int]:
+    def spread_order_size(self, legs: List[str]) -> Optional[float]:
+        """Clamp order size to per-leg headroom under max_shares."""
         wc = self.worker_config
-        size = min(wc.legacy_size, wc.max_order_size)
+        per_leg: List[float] = []
+        for side in legs:
+            room = self.spread_inventory.headroom(side, wc.max_shares)
+            if room < MIN_SHARES:
+                return None
+            per_leg.append(min(float(wc.spread_size), room, float(wc.max_order_size)))
+        size = min(per_leg)
         if size < MIN_SHARES:
             return None
-        return size
+        return round(size, 4)
+
+    def validate_spread_order_size(self, side: str, size: float) -> bool:
+        wc = self.worker_config
+        inv = self.spread_inventory
+        projected = inv.shares(side) + size
+        if size <= 0:
+            print(f"❌ [SIZE CHECK] {side} rejected: size={size} <= 0")
+            return False
+        if size > wc.max_order_size + 1e-9:
+            print(
+                f"❌ [SIZE CHECK] {side} rejected: size={size} "
+                f"> max_order_size={wc.max_order_size}"
+            )
+            exec_log(
+                "spread_size_rejected", side=side, size=size,
+                reason="max_order_size", asset=self.asset_type, window=self.window_slug,
+            )
+            return False
+        if projected > wc.max_shares + 1e-9:
+            print(
+                f"❌ [SIZE CHECK] {side} rejected: projected inventory "
+                f"{projected:.4f} > max_shares={wc.max_shares} "
+                f"(current={inv.shares(side):.4f}, order={size:.4f})"
+            )
+            exec_log(
+                "spread_size_rejected", side=side, size=size,
+                reason="max_shares", projected=projected,
+                asset=self.asset_type, window=self.window_slug,
+            )
+            return False
+        return True
 
     def _update_spread_dashboard(self) -> None:
         up_bid = self.bids.get("YES", 0.0)
@@ -2547,6 +2568,8 @@ class MarketWorker:
         dry_run: bool = False,
         fills: Optional[Dict[str, Tuple[float, float]]] = None,
     ) -> None:
+        if not fills:
+            return
         self.spread_captures += 1
         inv = self.spread_inventory
         mode = "DRY" if dry_run else "LIVE"
@@ -2566,6 +2589,8 @@ class MarketWorker:
     async def place_spread_gtc(
         self, side: str, price: float, size: int,
     ) -> Tuple[Optional[str], float]:
+        if not self.validate_spread_order_size(side, float(size)):
+            return None, 0.0
         ok, order_id, filled = await self.place_order_raw(
             side, price, size, order_type="GTC",
         )
@@ -2592,43 +2617,36 @@ class MarketWorker:
             pass
         return 0.0
 
-    def update_momentum_dashboard(self, signal, delta: Optional[float]) -> None:
-        self.dashboard["price_delta"] = round(float(delta or 0.0) * 100, 4)
-        self.dashboard["signal_stale"] = signal.is_stale
-        self.dashboard["binance_status"] = signal.status_label
+    def get_spread_unrealized_pnl(self) -> Tuple[float, float]:
+        """Mark-to-market for spread inventory (matched pairs @ $1, unpaired @ bid)."""
+        inv = self.spread_inventory
+        if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
+            return 0.0, 0.0
 
-        if signal.connection_status in ("pending", "connecting"):
-            self.dashboard["momentum_signal"] = "CONNECTING"
-            return
-        if signal.connection_status == "error" and signal.last_update <= 0:
-            self.dashboard["momentum_signal"] = signal.status_label
-            return
-        if signal.last_update <= 0:
-            self.dashboard["momentum_signal"] = "WARMING UP"
-            return
-        if signal.is_stale:
-            self.dashboard["momentum_signal"] = "STALE"
-            return
-        if delta is None:
-            self.dashboard["momentum_signal"] = "WARMING UP"
-            return
-        if delta >= self.worker_config.entry_min_delta:
-            self.dashboard["momentum_signal"] = f"BULL ↑ {self.dashboard['price_delta']:+.3f}%"
-        elif delta <= -self.worker_config.entry_min_delta:
-            self.dashboard["momentum_signal"] = f"BEAR ↓ {self.dashboard['price_delta']:+.3f}%"
-        else:
-            self.dashboard["momentum_signal"] = "NEUTRAL"
+        matched = inv.matched_pairs
+        yes_unpaired = max(0.0, inv.yes_shares - matched)
+        no_unpaired = max(0.0, inv.no_shares - matched)
+        yes_bid = self.bids.get("YES", 0.0)
+        no_bid = self.bids.get("NO", 0.0)
+
+        mark_value = (
+            matched * 1.0
+            + yes_unpaired * yes_bid
+            + no_unpaired * no_bid
+        )
+        total_cost = inv.yes_cost + inv.no_cost
+        unrealized = mark_value - total_cost
+        roi_pct = (unrealized / total_cost * 100) if total_cost > 0 else 0.0
+        return round(unrealized, 4), round(roi_pct, 2)
 
     def get_current_pnl(self) -> Tuple[float, float, str]:
-        if not self.position_side or self.entry_price <= 0:
-            return 0.0, 0.0, "white"
-        current_price = self.prices.get(self.position_side, 0.0)
-        if current_price <= 0 or self.position_size <= 0:
-            return 0.0, 0.0, "white"
-        pnl_pct     = ((current_price - self.entry_price) / self.entry_price) * 100
-        pnl_dollars = (current_price - self.entry_price) * self.position_size
-        color       = "red" if pnl_dollars < 0 else "green"
-        return round(pnl_dollars, 2), round(pnl_pct, 2), color
+        pnl_dollars, pnl_pct = self.get_spread_unrealized_pnl()
+        if pnl_dollars == 0.0 and pnl_pct == 0.0:
+            inv = self.spread_inventory
+            if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
+                return 0.0, 0.0, "white"
+        color = "red" if pnl_dollars < 0 else "green"
+        return pnl_dollars, pnl_pct, color
 
     def log_to_file(self, message: str):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2805,58 +2823,23 @@ class MarketWorker:
     # ═════════════════════════════════════════════════════════════════════
 
     async def check_logic(self, timer: str):
-        """Strategy-driven entry; legacy TP/SL when FILLED."""
+        """Spread capture entry — evaluates edge every tick."""
         y = self.prices.get("YES", 0.0)
         n = self.prices.get("NO",  0.0)
-        if y <= 0 or n <= 0:
-            return
-
-        y_c = round(y * 100)
-        n_c = round(n * 100)
+        y_c = round(y * 100) if y > 0 else 0
+        n_c = round(n * 100) if n > 0 else 0
         self.dashboard["yes"]   = y_c
         self.dashboard["no"]    = n_c
         self.dashboard["timer"] = timer
+        self._update_spread_dashboard()
         self.update_dashboard()
 
-        if self.worker_config.strategy == "spread_capture":
-            await self._check_spread_logic(y_c, n_c)
+        if y <= 0 or n <= 0:
             return
 
-        if self.trade_state == TradeState.FILLED:
-            await self._check_single_side_exit(self.position_side)
-            return
-
-        if self.trade_state in (TradeState.EXITING, TradeState.CLOSED, TradeState.ERROR):
-            return
-
-        if self._order_lock.locked():
-            return
-
-        if not is_trading_allowed():
-            log_weekend_block(self.asset_type, "YES/NO", round(max(y, n) * 100))
-            return
-
-        if asset_cooldown.is_entry_blocked(self.asset_type, self.window_slug):
-            log_cooldown_block(self.asset_type, self.window_slug, "YES/NO", round(max(y, n) * 100))
-            return
-
-        decision = await self.strategy.evaluate(self)
-        if decision:
-            print(f"[ENTRY] {self.asset_type.upper()} {self.window_slug} | "
-                  f"{decision.side} @ {round(decision.price*100)}c | "
-                  f"mode={decision.execution_mode} size={decision.size}")
-            self.log_to_file(
-                f"[ENTRY] {decision.side} @ {round(decision.price*100)}c "
-                f"mode={decision.execution_mode} size={decision.size}"
-            )
-            async with self._order_lock:
-                if self.trade_state != TradeState.IDLE:
-                    return
-                await self.strategy.execute(self, decision)
+        await self._check_spread_logic(y_c, n_c)
 
     async def _check_spread_logic(self, y_c: int, n_c: int) -> None:
-        self._update_spread_dashboard()
-
         if self.spread_state == SpreadState.PENDING:
             return
         if self._order_lock.locked():
@@ -2870,6 +2853,14 @@ class MarketWorker:
             log_cooldown_block(
                 self.asset_type, self.window_slug, "YES/NO", round(max(y_c, n_c)),
             )
+            return
+
+        inv = self.spread_inventory
+        at_cap = (
+            inv.headroom("YES", self.worker_config.max_shares) < MIN_SHARES
+            and inv.headroom("NO", self.worker_config.max_shares) < MIN_SHARES
+        )
+        if at_cap:
             return
 
         decision = await self.strategy.evaluate(self)
@@ -2896,32 +2887,6 @@ class MarketWorker:
             f"caps={self.spread_captures}"
         )
 
-    async def _check_single_side_exit(self, side: Optional[str]) -> bool:
-        """
-        Evaluate take-profit / stop-loss on the single open position.
-        Returns True if an exit was triggered (caller should return immediately).
-        """
-        if not side:
-            return False
-        entry_price   = self.entry_price
-        current_price = self.prices.get(side, 0.0)
-        if entry_price <= 0 or current_price <= 0:
-            return False
-
-        loss_pct = (entry_price - current_price) / entry_price
-        if loss_pct >= self.worker_config.stop_loss_pct / 100:
-            print(f"\n\n⚠️ STOP LOSS TRIGGERED: {side} -{loss_pct*100:.1f}%")
-            await self.market_exit(loss_pct, is_profit=False)
-            return True
-
-        gain_pct = (current_price - entry_price) / entry_price
-        if gain_pct >= self.worker_config.take_profit_pct / 100:
-            print(f"\n\n💰 TAKE PROFIT TRIGGERED: {side} +{gain_pct*100:.1f}%")
-            await self.market_exit(gain_pct, is_profit=True)
-            return True
-
-        return False
-
     # ── Order execution ────────────────────────────────────────────────
 
     async def place_order_raw(
@@ -2939,6 +2904,9 @@ class MarketWorker:
         token_id = (self.active_market["yes_id"] if side == "YES"
                     else self.active_market["no_id"])
         clean_price = max(0.01, min(0.99, round(price, 2)))
+
+        if not self.validate_spread_order_size(side, float(size)):
+            return False, None, False
 
         if self.is_dry_run():
             print(f"\n🧪 [DRY] BUY {size} {side} @ {round(clean_price*100)}c "
@@ -2983,672 +2951,6 @@ class MarketWorker:
                  order_type=order_type, order_id=order_id, filled=filled)
         return True, order_id, filled
 
-    async def execute_momentum_order(
-        self,
-        side: str,
-        price: float,
-        direction: Side,
-        *,
-        size: int,
-        order_type: str = "GTC",
-        wait_for_fill: bool = True,
-        fok_timeout_sec: float = 3.0,
-        use_price_as_is: bool = False,
-    ) -> bool:
-        if not self.active_market:
-            return False
-        if direction != Side.BUY:
-            await self.execute_order(side, price, direction)
-            return self.trade_state == TradeState.FILLED
-
-        if self.trade_state != TradeState.IDLE:
-            return False
-        if asset_cooldown.is_entry_blocked(self.asset_type, self.window_slug):
-            return False
-        if is_locked_price(price):
-            return False
-        if price > MAX_BUY_PRICE:
-            return False
-        if size < MIN_SHARES:
-            print(f"⚠️ [SKIP] Order size {size} below minimum {MIN_SHARES} shares")
-            return False
-
-        submit_price = price if use_price_as_is else clamp_buy_price(price)
-
-        if self.is_dry_run():
-            print(f"\n🧪 [DRY] {order_type} BUY {size} {side} @ {round(submit_price*100)}c")
-            self.update_state(side, submit_price, direction, float(size))
-            return True
-
-        if order_type.upper() == "FOK" and wait_for_fill:
-            ok, order_id, filled = await self.place_order_raw(
-                side, submit_price, size, order_type="FOK",
-            )
-            if ok and filled:
-                self.update_state(side, submit_price, direction, float(size))
-                return True
-            if order_id and order_id != "dry-run":
-                self._try_cancel_order(order_id)
-            return False
-
-        timeout = fok_timeout_sec if order_type.upper() == "FOK" else FILL_TIMEOUT_SEC
-        success, actual_size = await self.confirmed_execute(
-            side,
-            submit_price if use_price_as_is else price,
-            direction,
-            timeout_sec=timeout,
-            requested_size=float(size),
-            order_type=order_type,
-            use_price_as_is=use_price_as_is,
-        )
-        return success and actual_size > 0
-
-    async def execute_order(self, side: str, price: float, direction: Side):
-        """
-        Entry point for placing a single order.
-
-        Guards (checked in order):
-          1. active_market must be set.
-          2. _order_lock prevents re-entrant concurrent orders.
-          3. MIN_ENTRY_PRICE gate (BUY only): price must be >= 0.90.
-          4. Locked-price guard (BUY only): second independent check against
-             rapid price movement between check_logic and order placement.
-          5. MAX_BUY_PRICE ceiling (BUY only): price must not exceed 0.99.
-          6. Duplicate-entry guard: trade_state must be IDLE for BUY.
-
-        On success, confirmed_execute() calls update_state() with the actual
-        submitted price and confirmed fill size.
-        """
-        if not self.active_market:
-            return
-        if self._order_lock.locked():
-            print(f"⏳ [LOCK] Order in flight — skipping {direction} {side}")
-            return
-
-        if direction == Side.BUY:
-            # Prevent entering if a position is already open.
-            if self.trade_state != TradeState.IDLE:
-                print(f"⚠️ [ABORT] Trade state is {self.trade_state.name} — entry suppressed.")
-                return
-            if asset_cooldown.is_entry_blocked(self.asset_type, self.window_slug):
-                print(f"🚫 [COOLDOWN] [{self.asset_type.upper()} {self.window_slug}] BUY blocked.")
-                exec_log("execute_order_cooldown_blocked", side=side, price=price,
-                         asset=self.asset_type, window=self.window_slug)
-                return
-            if self.worker_config.strategy == "legacy" and price < self.worker_config.min_entry_price:
-                print(f"⚠️ [ABORT] Price {round(price*100)}c below legacy min_entry_price")
-                return
-            if is_locked_price(price):
-                print(f"🔒 [ABORT] Price {round(price*100)}c is a locked price — refusing BUY.")
-                exec_log("execute_order_locked_price", side=side, price=price)
-                return
-            if price > MAX_BUY_PRICE:
-                print(f"⚠️ [ABORT] Price {round(price*100)}c exceeds MAX_BUY_PRICE "
-                      f"({round(MAX_BUY_PRICE*100)}c) — skipping")
-                return
-
-        async with self._order_lock:
-            t_id = (self.active_market["yes_id"] if side == "YES"
-                    else self.active_market["no_id"])
-
-            if direction == Side.BUY:
-                calculated_size = float(self.order_size_shares() or MIN_SHARES)
-            else:
-                print(f"🔍 [CHAIN] Verifying shares for {side} (ID: {t_id})...")
-                actual_balance = await self.account.get_onchain_share_balance_async(t_id)
-                if actual_balance <= 0:
-                    reason = "RPC Error" if actual_balance < 0 else "0 Shares Found"
-                    print(f"🛑 [ABORT] Cannot Sell: {reason}. Check wallet.")
-                    return
-                calculated_size = actual_balance
-                if calculated_size < 0.05:
-                    print(f"⚠️ [DUST TRAP] Balance {calculated_size:.4f} is dust — skipping sell")
-                    return
-
-            if self.is_dry_run():
-                print(f"\n🧪 [DRY] {direction} {calculated_size} {side} @ {round(price*100)}c")
-                self.update_state(side, price, direction, calculated_size)
-                return
-
-            success, actual_size = await self.confirmed_execute(
-                side, price, direction, timeout_sec=FILL_TIMEOUT_SEC,
-                requested_size=calculated_size,
-            )
-            if success:
-                print(f"✅ execute_order complete: {direction} {side} "
-                      f"actual_size={actual_size:.4f} @ {round(self.entry_price*100)}c")
-            else:
-                print(f"❌ execute_order: no confirmed fill for {direction} {side}")
-                exec_log("execute_order_no_fill", side=side,
-                         direction=str(direction), price=price)
-                self.trade_state = TradeState.ERROR
-
-    def update_state(self, side: str, price: float, direction: Side, size: float):
-        """
-        Update position tracking after a confirmed fill.
-        price is the actual submitted price — never the pre-slippage requested price.
-        """
-        if direction == Side.BUY:
-            self.entry_timestamp = t.time()
-            self.position_side   = side
-            self.entry_price     = price
-            self.position_size   = size
-            self.trade_state     = TradeState.FILLED
-            self.dashboard["status"] = f"{side} FILLED"
-            self.log_trade(side, price, "buy", size=size)
-            print(f"[ENTRY] Bought {side} @ {round(price*100)}c | "
-                  f"Size: {size:.4f} | State → FILLED")
-        else:
-            # SELL — clear the position, return to IDLE.
-            exit_action = getattr(self, "_history_exit_action", "sell")
-            self.log_trade(side, price, exit_action, size=size)
-            self._history_exit_action = "sell"
-            self.position_side   = None
-            self.position_size   = 0.0
-            self.entry_price     = 0.0
-            self.entry_timestamp = None
-            self.trade_state     = TradeState.IDLE
-
-    # ── Exit logic ─────────────────────────────────────────────────────
-
-    async def _close_open_position(
-        self,
-        outcome_type: str,
-        label: str,
-        pct: float = 0.0,
-        is_profit: bool = False,
-        blacklist: bool = True,
-        max_sell_attempts: int = 3,
-    ) -> dict:
-        """
-        Shared sell/cashout path used by TP/SL exits and manual dashboard cashout.
-        Handles partial fills via retries, failed orders, and state sync.
-        """
-        emoji = "💰" if is_profit or outcome_type == "MANUAL_CASHOUT" else "🛑"
-        color = GREEN if is_profit or outcome_type == "MANUAL_CASHOUT" else RED
-        print(f"\n{BOLD}{color}{emoji} Executing {label} Exit...{RESET}")
-        exec_log("exit_start", label=label, pct=pct, outcome_type=outcome_type)
-
-        self.exited      = True
-        self.trade_state = TradeState.EXITING
-        self._history_exit_action = "sell"
-
-        side           = self.position_side
-        entry_val      = self.entry_price
-        total_spent    = 0.0
-        total_received = 0.0
-        exit_price     = 0.0
-        sold_total     = 0.0
-        last_error     = None
-
-        if side and self.position_size > 0:
-            total_spent = self.entry_price * self.position_size
-            exit_price  = max(0.01, self.prices.get(side, self.entry_price) - 0.02)
-
-            for attempt in range(1, max_sell_attempts + 1):
-                remaining = self.position_size
-                if remaining <= MIN_FILL_DELTA:
-                    break
-
-                price_cents = f"{round(exit_price * 100)}c"
-                print(f"📡 SELL attempt {attempt}/{max_sell_attempts}: "
-                      f"{remaining:.2f} {side} @ {price_cents}...")
-
-                if self.is_dry_run():
-                    actual_size    = remaining
-                    received       = actual_size * exit_price
-                    total_received += received
-                    sold_total     += actual_size
-                    self.update_state(side, exit_price, Side.SELL, actual_size)
-                    print(f"  → 🧪 DRY SELL {actual_size:.2f} @ {price_cents}")
-                    break
-
-                success, sold_size = await self.confirmed_execute(
-                    side, exit_price, Side.SELL, timeout_sec=20.0)
-
-                if success and sold_size > 0:
-                    received        = sold_size * exit_price
-                    total_received += received
-                    sold_total     += sold_size
-                    if self.trade_state == TradeState.IDLE:
-                        break
-                    if self.position_size <= MIN_FILL_DELTA:
-                        break
-                    exit_price = max(0.01, self.prices.get(side, exit_price) - 0.02)
-                    await asyncio.sleep(1.5)
-                else:
-                    last_error = f"Sell attempt {attempt} failed"
-                    print(f"⚠️ {last_error}")
-                    await asyncio.sleep(2.0)
-                    exit_price = max(0.01, self.prices.get(side, exit_price) - 0.02)
-
-            if sold_total <= 0 and side and self.active_market:
-                token_id = (self.active_market["yes_id"] if side == "YES"
-                            else self.active_market["no_id"])
-                chain_bal = await self.account.get_onchain_share_balance_async(token_id)
-                if chain_bal <= MIN_FILL_DELTA:
-                    sold_total     = self.position_size
-                    total_received = 0.0
-                    await self.reset_state()
-                    return {
-                        "ok": False,
-                        "error": last_error or "Sell failed — position already flat on-chain",
-                        "asset": self.asset_type.upper(),
-                    }
-
-        if sold_total <= 0 and total_spent > 0:
-            self.trade_state = TradeState.FILLED
-            self.exited       = False
-            return {
-                "ok":    False,
-                "error": last_error or "Unable to sell position",
-                "asset": self.asset_type.upper(),
-            }
-
-        net_payout   = total_received - total_spent
-        result_color = GREEN if net_payout > 0 else RED
-        print(f"\n{BOLD}{color}--- {label} SUMMARY ---{RESET}")
-        print(f"📉 Total Invested: ${total_spent:.3f}")
-        print(f"💵 Total Received: ${total_received:.3f}")
-        print(f"📊 Net Payout:     {result_color}${net_payout:.3f}{RESET}")
-        self.log_to_file(f"{emoji} {label} EXIT | Spent: ${total_spent:.2f} | "
-                         f"Recv: ${total_received:.2f} | Net: ${net_payout:.2f}")
-        exec_log("exit_complete", label=label, total_spent=total_spent,
-                 total_received=total_received, net_payout=net_payout)
-
-        actual_pct = (round(((exit_price - entry_val) / entry_val) * 100, 1)
-                      if entry_val > 0 else 0.0)
-        pct_key    = "profit_pct" if is_profit else "loss_pct"
-        details = {
-            "side":             side,
-            "entry_price":      entry_val,
-            "exit_price":       exit_price,
-            "size":             sold_total or self.position_size,
-            pct_key:            abs(actual_pct),
-            "duration_seconds": round(t.time() - (self.entry_timestamp or t.time()), 2),
-        }
-        self.log_pnl(outcome_type, net_payout, details)
-        self.trade_state = TradeState.CLOSED
-
-        if blacklist and self.active_market:
-            slug = self.active_market.get("slug") or self.market_slug
-            if slug:
-                self.processed_markets.add(slug)
-                self.market_exit_reasons[slug] = outcome_type
-                print(f"🚫 MARKET BLACKLISTED: {slug} (after {label})")
-
-        print(f"\n{BOLD}{GREEN}♻️  Trade cycle completed. Resetting state for next market...{RESET}")
-        self.exited = False
-        await self.reset_state()
-        await asyncio.sleep(4.0)
-
-        return {
-            "ok":             True,
-            "asset":          self.asset_type.upper(),
-            "net_payout":     round(net_payout, 4),
-            "total_spent":    round(total_spent, 4),
-            "total_received": round(total_received, 4),
-            "exit_price":     round(exit_price, 4),
-        }
-
-    async def market_exit(self, pct: float, is_profit: bool = False):
-        """Take-profit or stop-loss exit on the single open position."""
-        label        = "TAKE PROFIT" if is_profit else "STOP LOSS"
-        outcome_type = "TAKE_PROFIT" if is_profit else "STOP_LOSS"
-        await self._close_open_position(
-            outcome_type=outcome_type,
-            label=label,
-            pct=pct,
-            is_profit=is_profit,
-            blacklist=True,
-        )
-
-    async def manual_cashout(self) -> dict:
-        """
-        Dashboard-triggered cashout. Uses the same close path as TP/SL exits.
-        Not available for spread_capture workers.
-        """
-        if self.worker_config.strategy == "spread_capture":
-            return {
-                "ok": False,
-                "error": "Cashout not available for spread capture strategy",
-                "asset": self.asset_type.upper(),
-            }
-        if self._cashout_in_progress:
-            return {"ok": False, "error": "Cashout already in progress",
-                    "asset": self.asset_type.upper()}
-        if self.trade_state != TradeState.FILLED:
-            return {"ok": False, "error": "No open position",
-                    "asset": self.asset_type.upper()}
-        if not self.position_side or self.position_size <= MIN_FILL_DELTA:
-            return {"ok": False, "error": "No open position",
-                    "asset": self.asset_type.upper()}
-        if self._order_lock.locked():
-            return {"ok": False, "error": "Order already in progress",
-                    "asset": self.asset_type.upper()}
-
-        self._cashout_in_progress = True
-        try:
-            async with self._order_lock:
-                if self.trade_state != TradeState.FILLED:
-                    return {"ok": False, "error": "No open position",
-                            "asset": self.asset_type.upper()}
-                return await self._close_open_position(
-                    outcome_type="MANUAL_CASHOUT",
-                    label="MANUAL CASHOUT",
-                    is_profit=False,
-                    blacklist=False,
-                    max_sell_attempts=3,
-                )
-        finally:
-            self._cashout_in_progress = False
-
-    def get_position_snapshot(self) -> Optional[Dict]:
-        """
-        Live open-position row for the dashboard Positions tab.
-        Returns None when no open position / inventory exists.
-        """
-        if self.worker_config.strategy == "spread_capture":
-            inv = self.spread_inventory
-            if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
-                return None
-            slug = ((self.active_market.get("slug") if self.active_market else None)
-                    or self.market_slug or self.asset_type)
-            market_name = ((self.active_market.get("question") if self.active_market else None)
-                           or f"{self.asset_type.upper()} Up or Down")
-            matched = inv.matched_pairs
-            yes_bid = self.bids.get("YES", 0.0)
-            no_bid = self.bids.get("NO", 0.0)
-            mark_value = (
-                matched * 1.0
-                + inv.yes_shares * yes_bid
-                + inv.no_shares * no_bid
-                - matched * (yes_bid + no_bid)
-            )
-            total_cost = inv.yes_cost + inv.no_cost
-            unrealized = round(mark_value - total_cost, 4)
-            return {
-                "id":                  f"{self.asset_type}:{self.window_slug}:{slug}:spread",
-                "asset":               self.asset_type.upper(),
-                "window":              self.window_slug,
-                "market":              market_name,
-                "slug":                slug,
-                "side":                "SPREAD",
-                "strategy":            "spread_capture",
-                "yes_shares":          round(inv.yes_shares, 4),
-                "no_shares":           round(inv.no_shares, 4),
-                "matched_pairs":       round(matched, 4),
-                "spread_imbalance":    round(inv.imbalance, 4),
-                "entry_price":         0.0,
-                "current_price":       0.0,
-                "entry_price_cents":   0.0,
-                "current_price_cents": 0.0,
-                "roi_pct":             0.0,
-                "unrealized_pnl":      unrealized,
-                "size":                round(inv.yes_shares + inv.no_shares, 4),
-                "size_usd":            round(total_cost, 2),
-                "cashout_available":   False,
-            }
-
-        if self.trade_state != TradeState.FILLED:
-            return None
-        if not self.position_side or self.position_size <= MIN_FILL_DELTA:
-            return None
-        if self.entry_price <= 0:
-            return None
-
-        current_price = self.prices.get(self.position_side, 0.0)
-        pnl_dollars, pnl_pct, _ = self.get_current_pnl()
-        slug = ((self.active_market.get("slug") if self.active_market else None)
-                or self.market_slug or self.asset_type)
-        market_name = ((self.active_market.get("question") if self.active_market else None)
-                       or f"{self.asset_type.upper()} Up or Down")
-
-        return {
-            "id":                  f"{self.asset_type}:{self.window_slug}:{slug}",
-            "asset":               self.asset_type.upper(),
-            "window":              self.window_slug,
-            "market":              market_name,
-            "slug":                slug,
-            "side":                self.position_side,
-            "entry_price":         round(self.entry_price, 4),
-            "current_price":       round(current_price, 4),
-            "entry_price_cents":   round(self.entry_price * 100, 1),
-            "current_price_cents": round(current_price * 100, 1),
-            "roi_pct":             pnl_pct,
-            "unrealized_pnl":      pnl_dollars,
-            "size":                round(self.position_size, 4),
-            "size_usd":            round(self.entry_price * self.position_size, 2),
-            "cashout_available":   not self._cashout_in_progress,
-        }
-
-    def _interval_seconds(self) -> int:
-        return self.worker_config.interval_seconds
-
-    def _interval_start(self, ts: int) -> int:
-        sec = self._interval_seconds()
-        return (ts // sec) * sec
-
-    def current_interval_starts(self, now_ts: Optional[int] = None) -> Tuple[int, int]:
-        now = now_ts if now_ts is not None else int(datetime.now(timezone.utc).timestamp())
-        base = self._interval_start(now)
-        return base, base + self._interval_seconds()
-
-    # ── Confirmed order execution ──────────────────────────────────────
-
-    async def confirmed_execute(
-        self,
-        side: str,
-        price: float,
-        direction: Side,
-        timeout_sec: float = 15.0,
-        requested_size: Optional[float] = None,
-        order_type: str = "GTC",
-        use_price_as_is: bool = False,
-    ) -> Tuple[bool, float]:
-        """
-        Place a limit order via the shared (account-level) V2 CLOB client and
-        wait for fill confirmation.
-
-        Confirmation uses two independent signals:
-          1. CLOB order status endpoint (filled / matched / partially_filled)
-          2. On-chain share balance delta (ground truth, MIN_FILL_DELTA threshold)
-
-        update_state() is only called after a confirmed fill — never optimistically.
-        The actual submitted price (clean_price, with slippage bump) is passed to
-        update_state(), not the pre-slippage requested price.
-        Stale or unmatched orders are cancelled on timeout.
-
-        All order placement / status / cancel calls go through self.account
-        (the single shared AccountService), never through a per-worker client.
-        """
-        if not self.active_market:
-            print("❌ No active market for confirmed_execute")
-            return False, 0.0
-
-        token_id = (self.active_market["yes_id"] if side == "YES"
-                    else self.active_market["no_id"])
-
-        if direction == Side.BUY:
-            if requested_size is not None:
-                req_size = requested_size
-            else:
-                req_size = float(self.order_size_shares() or MIN_SHARES)
-            requested_size = req_size
-        else:
-            print(f"🔍 [CHAIN] Verifying shares for {side} sell (ID: {token_id})...")
-            current_balance = await self.account.get_onchain_share_balance_async(token_id)
-            if current_balance <= 0:
-                print(f"🛑 Cannot sell: balance {current_balance}")
-                return False, 0.0
-            requested_size = current_balance
-            if requested_size < 0.05:
-                print(f"⚠️ Dust trap: only {requested_size:.4f} — skipping sell")
-                return False, 0.0
-
-        if self.is_dry_run():
-            print(f"\n🧪 [DRY CONFIRMED] {direction} {requested_size:.2f} {side} @ {round(price*100)}c")
-            self.update_state(side, price, direction, requested_size)
-            return True, requested_size
-
-        if direction == Side.BUY:
-            clean_price = price if use_price_as_is else clamp_buy_price(price)
-        else:
-            clean_price = clamp_sell_price(price)
-
-        order_id    = None
-        order_state = OrderState.CREATED
-
-        try:
-            side_str = "BUY" if direction == Side.BUY else "SELL"
-            resp     = self.account.create_and_post_order(
-                side_str, clean_price, requested_size, token_id, order_type=order_type)
-            order_state = OrderState.SUBMITTED
-
-            exec_log("order_submit",
-                     side=side, direction=side_str,
-                     requested_price=price, submitted_price=clean_price,
-                     size=requested_size, token_id=token_id)
-
-            if isinstance(resp, dict):
-                order_id = resp.get('orderID') or resp.get('order_id')
-            elif isinstance(resp, str):
-                try:
-                    parsed   = json.loads(resp)
-                    order_id = parsed.get('orderID') or parsed.get('order_id')
-                except Exception:
-                    pass
-
-            exec_log("order_accepted",
-                     side=side, direction=side_str,
-                     submitted_price=clean_price, size=requested_size,
-                     order_id=order_id, raw_resp=str(resp)[:200])
-
-            print(f"\n🚀 [LIVE] {direction} {requested_size:.2f} {side} "
-                  f"@ {round(clean_price*100)}c | OrderID: {order_id or 'unknown'}")
-
-        except Exception as e:
-            exec_log("order_failed", side=side, error=str(e))
-            print(f"❌ Order placement failed: {e}")
-            return False, 0.0
-
-        start_time      = t.time()
-        initial_balance = await self.account.get_onchain_share_balance_async(token_id)
-        print(f"⏳ Confirming {direction} ({timeout_sec}s timeout) | "
-              f"Initial balance: {initial_balance:.4f}")
-
-        while t.time() - start_time < timeout_sec:
-            await asyncio.sleep(2.5)
-            confirmed      = False
-            confirmed_size = 0.0
-
-            # Check 1: CLOB order status
-            if order_id:
-                try:
-                    order_info = self.account.get_order_status(order_id)
-                    if isinstance(order_info, str):
-                        try:
-                            order_info = json.loads(order_info)
-                        except json.JSONDecodeError:
-                            order_info = {}
-                    if isinstance(order_info, dict):
-                        clob_status  = str(order_info.get('status', '')).lower()
-                        size_matched = float(order_info.get('size_matched', 0) or 0)
-                        size_remain  = float(order_info.get('size_remaining', requested_size) or requested_size)
-
-                        exec_log("order_status_check",
-                                 order_id=order_id, clob_status=clob_status,
-                                 size_matched=size_matched, size_remaining=size_remain,
-                                 elapsed=round(t.time() - start_time, 1))
-
-                        if clob_status in ['filled', 'matched', 'closed']:
-                            confirmed_size = size_matched if size_matched > 0 else requested_size
-                            confirmed      = True
-                            order_state    = OrderState.FILLED
-                            print(f"✅ CLOB confirms {direction} FILLED: {confirmed_size:.4f}")
-                        elif clob_status in ['partially_filled', 'partial']:
-                            confirmed_size = size_matched
-                            if size_matched >= MIN_FILL_DELTA:
-                                confirmed   = True
-                                order_state = OrderState.PARTIALLY_FILLED
-                                print(f"⚠️ CLOB partial fill: {size_matched:.4f} / {requested_size:.4f}")
-                        elif clob_status in ['cancelled', 'rejected']:
-                            order_state = (OrderState.CANCELLED if clob_status == 'cancelled'
-                                           else OrderState.REJECTED)
-                            exec_log("order_terminal", order_id=order_id, status=clob_status)
-                            print(f"🚫 Order {clob_status}: {order_id}")
-                            return False, 0.0
-
-                except Exception as e:
-                    print(f"CLOB status check failed: {e} — falling back to on-chain")
-                    exec_log("clob_check_error", order_id=order_id, error=str(e))
-
-            # Check 2: on-chain balance delta (ground truth)
-            current_balance = await self.account.get_onchain_share_balance_async(token_id)
-            if direction == Side.BUY:
-                delta = current_balance - initial_balance
-                if delta >= MIN_FILL_DELTA:
-                    print(f"✅ On-chain BUY confirmed: +{delta:.4f} (now {current_balance:.4f})")
-                    exec_log("onchain_fill_confirmed",
-                             direction="BUY", delta=delta,
-                             initial=initial_balance, current=current_balance,
-                             order_id=order_id)
-                    if not confirmed:
-                        confirmed_size = delta
-                    confirmed = True
-                    if delta > confirmed_size:
-                        confirmed_size = delta
-            else:
-                sold = initial_balance - current_balance
-                if sold >= MIN_FILL_DELTA:
-                    print(f"✅ On-chain SELL confirmed: sold {sold:.4f} (remaining {current_balance:.4f})")
-                    exec_log("onchain_fill_confirmed",
-                             direction="SELL", sold=sold,
-                             initial=initial_balance, current=current_balance,
-                             order_id=order_id)
-                    if not confirmed:
-                        confirmed_size = sold
-                    confirmed = True
-                    if sold > confirmed_size:
-                        confirmed_size = sold
-
-            if confirmed:
-                self.update_state(side, clean_price, direction, confirmed_size)
-                exec_log("state_updated",
-                         side=side, direction=str(direction),
-                         actual_price=clean_price, actual_size=confirmed_size,
-                         order_id=order_id)
-                return True, confirmed_size
-
-            print(f"  Still waiting... balance now {current_balance:.4f}")
-
-        # ── Timeout ──────────────────────────────────────────────────────
-        final_balance     = await self.account.get_onchain_share_balance_async(token_id)
-        delta_at_timeout  = ((final_balance - initial_balance) if direction == Side.BUY
-                             else (initial_balance - final_balance))
-
-        exec_log("order_timeout",
-                 order_id=order_id, timeout_sec=timeout_sec,
-                 initial_balance=initial_balance, final_balance=final_balance,
-                 delta_at_timeout=delta_at_timeout)
-
-        print(f"⌛ Confirmation timeout | Final balance: {final_balance:.4f} "
-              f"(started {initial_balance:.4f}) | delta={delta_at_timeout:.4f}")
-
-        if delta_at_timeout >= MIN_FILL_DELTA:
-            print(f"⚠️ Recording partial fill at timeout: "
-                  f"{delta_at_timeout:.4f} @ {round(clean_price*100)}c")
-            self.update_state(side, clean_price, direction, delta_at_timeout)
-            exec_log("partial_fill_at_timeout",
-                     side=side, delta=delta_at_timeout,
-                     price=clean_price, order_id=order_id)
-            if order_id:
-                self._try_cancel_order(order_id)
-            return True, delta_at_timeout
-
-        if order_id:
-            self._try_cancel_order(order_id)
-        return False, 0.0
 
     def _try_cancel_order(self, order_id: str):
         try:
@@ -3670,6 +2972,40 @@ class MarketWorker:
     async def merge_shares(self, amount_to_merge: float):
         """Merge YES+NO shares back into pUSD on-chain for this worker's active market."""
         return await self.account.merge_shares(self.active_market, amount_to_merge)
+
+    def get_position_snapshot(self) -> Optional[Dict]:
+        """Live spread inventory row for the dashboard Positions tab."""
+        inv = self.spread_inventory
+        if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
+            return None
+        slug = ((self.active_market.get("slug") if self.active_market else None)
+                or self.market_slug or self.asset_type)
+        market_name = ((self.active_market.get("question") if self.active_market else None)
+                       or f"{self.asset_type.upper()} Up or Down")
+        pnl_dollars, pnl_pct = self.get_spread_unrealized_pnl()
+        total_cost = inv.yes_cost + inv.no_cost
+        return {
+            "id":                  f"{self.asset_type}:{self.window_slug}:{slug}:spread",
+            "asset":               self.asset_type.upper(),
+            "window":              self.window_slug,
+            "market":              market_name,
+            "slug":                slug,
+            "side":                "SPREAD",
+            "strategy":            "spread_capture",
+            "yes_shares":          round(inv.yes_shares, 4),
+            "no_shares":           round(inv.no_shares, 4),
+            "matched_pairs":       round(inv.matched_pairs, 4),
+            "spread_imbalance":    round(inv.imbalance, 4),
+            "entry_price":         0.0,
+            "current_price":       0.0,
+            "entry_price_cents":   0.0,
+            "current_price_cents": 0.0,
+            "roi_pct":             pnl_pct,
+            "unrealized_pnl":      pnl_dollars,
+            "size":                round(inv.yes_shares + inv.no_shares, 4),
+            "size_usd":            round(total_cost, 2),
+            "cashout_available":   False,
+        }
 
     # ── State reset ────────────────────────────────────────────────────
 
@@ -3814,22 +3150,21 @@ class MarketWorker:
 
     def get_dashboard_data(self) -> dict:
         pnl_dollars, pnl_pct, _ = self.get_current_pnl()
+        inv = self.spread_inventory
 
-        state_labels = {
-            TradeState.IDLE:    self.dashboard.get("status", "WAITING"),
-            TradeState.FILLED:  f"{self.position_side} FILLED",
-            TradeState.EXITING: "EXITING",
-            TradeState.CLOSED:  "CLOSED",
-            TradeState.ERROR:   "ERROR",
-        }
-        status = state_labels.get(self.trade_state, "WAITING")
-
-        if self.position_side and self.entry_price > 0:
-            entry         = round(self.entry_price * 100, 1)
-            sz            = round(self.position_size, 2)
-            position_text = f"{self.position_side} @ {entry}c ×{sz}"
+        if inv.yes_shares > 0 or inv.no_shares > 0:
+            position_text = (
+                f"Y{inv.yes_shares:.1f}/N{inv.no_shares:.1f} "
+                f"(±{inv.imbalance:.1f}) caps={self.spread_captures}"
+            )
         else:
             position_text = "-"
+
+        spread_status = (
+            "PENDING" if self.spread_state == SpreadState.PENDING else "HUNTING"
+        )
+        if inv.yes_shares > 0 or inv.no_shares > 0:
+            spread_status = f"INVENTORY {spread_status}"
 
         market_start_iso = None
         market_end_iso   = None
@@ -3841,33 +3176,25 @@ class MarketWorker:
 
         cd = asset_cooldown.get_status(self.asset_type, self.window_slug)
         schedule_ok = is_trading_allowed()
-
-        spread_status = "IDLE"
-        if self.worker_config.strategy == "spread_capture":
-            spread_status = (
-                "PENDING" if self.spread_state == SpreadState.PENDING else "HUNTING"
-            )
-            inv = self.spread_inventory
-            if inv.yes_shares > 0 or inv.no_shares > 0:
-                position_text = (
-                    f"Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f} "
-                    f"(±{inv.imbalance:.0f}) ×{self.spread_captures}"
-                )
-            else:
-                position_text = f"spread (edge>{self.worker_config.spread_threshold:.3f})"
+        edge = self.dashboard.get("spread_edge", 0.0)
+        edge_cents = round(edge * 100, 2)
+        thr_cents = round(self.worker_config.spread_threshold * 100, 2)
 
         return {
             "asset":              self.asset_type.upper(),
             "window":             self.window_slug,
-            "strategy":           self.worker_config.strategy,
-            "execution_mode":     self.worker_config.execution_mode,
+            "strategy":           "spread_capture",
             "yes":                round(self.prices.get("YES", 0) * 100),
             "no":                 round(self.prices.get("NO",  0) * 100),
             "yes_bid_c":          self.dashboard.get("yes_bid_c", 0),
             "no_bid_c":           self.dashboard.get("no_bid_c", 0),
             "combined_bid_c":     self.dashboard.get("combined_bid_c", 0),
-            "spread_edge":        self.dashboard.get("spread_edge", 0.0),
+            "spread_edge":        edge,
+            "spread_edge_cents":  edge_cents,
             "spread_threshold":   self.worker_config.spread_threshold,
+            "spread_threshold_cents": thr_cents,
+            "edge_above_threshold": edge > self.worker_config.spread_threshold,
+            "max_shares":         self.worker_config.max_shares,
             "yes_shares":         self.dashboard.get("yes_shares", 0.0),
             "no_shares":          self.dashboard.get("no_shares", 0.0),
             "spread_imbalance":   self.dashboard.get("spread_imbalance", 0.0),
@@ -3875,14 +3202,12 @@ class MarketWorker:
             "spread_state":       spread_status,
             "timer":              self.dashboard.get("timer",    "--:--"),
             "listener":           self.get_listener_countdown(),
-            "status":             status if self.worker_config.strategy != "spread_capture"
-                                  else spread_status,
+            "status":             spread_status,
             "position":           position_text,
             "outcome":            self.dashboard.get("outcome", "PENDING"),
-            "trade_state":        self.trade_state.name,
             "dry_run":            self.is_dry_run(),
-            "pnl_dollars":        round(pnl_dollars,         2),
-            "pnl_pct":            round(pnl_pct,             2),
+            "pnl_dollars":        pnl_dollars,
+            "pnl_pct":            pnl_pct,
             "cumulative_pnl":     round(self.cumulative_pnl, 2),
             "wins":               self.wins,
             "losses":             self.losses,
@@ -3914,45 +3239,7 @@ class MarketWorker:
         else:
             self.market_outcome = "UNKNOWN"
         self.dashboard["outcome"] = self.market_outcome
-
-        if self.worker_config.strategy == "spread_capture":
-            self._settle_spread_market()
-            return
-
-        if not self.position_side or self.position_size <= 0:
-            print(f"\n{BOLD}{YELLOW}ℹ️  No position taken this market.{RESET}")
-            self._finish_market_merge()
-            return
-
-        total_spent   = self.entry_price * self.position_size
-        actual_profit = (self.position_size - total_spent
-                         if self.market_outcome == self.position_side else -total_spent)
-        price_in_cents = lambda p: f"{round(p * 100)}c"
-        print(f"\n\n{BOLD}{GREEN}--- 🚀 SINGLE SIDE RESULT ---{RESET}")
-        print(f"⏱️ Market Outcome:      {self.market_outcome}")
-        print(f"💰 Bought Side:         {self.position_side} @ "
-              f"{price_in_cents(self.entry_price)}")
-        print(f"📊 Shares Bought:       {self.position_size:.4f}")
-        print(f"📉 Total Invested:      ${total_spent:.4f}")
-        print(f"📈 Net Profit:          {GREEN if actual_profit >= 0 else RED}"
-              f"${actual_profit:.4f}{RESET}")
-
-        settle_price = (1.0 if self.market_outcome == self.position_side else 0.0)
-        self.log_trade(
-            self.position_side, settle_price, "redeem", size=self.position_size,
-        )
-
-        self.log_pnl("HODL", actual_profit, {
-            "side":           self.position_side,
-            "bought_side":    self.position_side,
-            "entry_price":    self.entry_price,
-            "size":           self.position_size,
-            "shares":         self.position_size,
-            "outcome":        self.market_outcome,
-            "duration_seconds": round(t.time() - (self.entry_timestamp or t.time()), 2),
-        })
-
-        self._finish_market_merge()
+        self._settle_spread_market()
 
     def _settle_spread_market(self) -> None:
         inv = self.spread_inventory
@@ -4056,19 +3343,17 @@ class MarketWorker:
     async def start(self):
         """Per-worker trading loop for one (asset, window) pair."""
         wc = self.worker_config
-        print(f"🤖 EmilianoBot — {wc.strategy.upper()} → "
+        print(f"🤖 EmilianoBot — SPREAD CAPTURE → "
               f"{self.asset_type.upper()} {self.window_slug} markets...")
-        print(f"  Strategy          : {wc.strategy}")
         print(f"  Market interval   : {self.window_slug} ({wc.interval_seconds}s)")
         print(f"  Listener window   : final {wc.listener_activate_secs}s")
-        if wc.strategy == "spread_capture":
-            print(f"  Spread threshold  : {wc.spread_threshold:.4f} ({wc.spread_threshold*100:.1f}c edge)")
-            print(f"  Size              : {wc.spread_size} shares (max {wc.max_order_size})")
-            print(f"  Cooldown          : {wc.trade_cooldown_ms}ms after dual leg")
-        else:
-            print(f"  Execution         : {wc.execution_mode}")
-            print(f"  Size              : {wc.legacy_size} shares (max {wc.max_order_size})")
-            print(f"  Min entry         : {wc.min_entry_price*100:.0f}c")
+        print(f"  Spread threshold  : {wc.spread_threshold:.4f} ({wc.spread_threshold*100:.1f}c edge)")
+        print(f"  Order size        : {wc.spread_size} shares (max order {wc.max_order_size})")
+        print(f"  Max inventory     : {wc.max_shares} shares per leg")
+        print(f"  Cooldown          : {wc.trade_cooldown_ms}ms after dual leg")
+        if self.is_dry_run():
+            print(f"  Dry-run fill delay: {wc.dry_run_fill_delay_min_ms}-"
+                  f"{wc.dry_run_fill_delay_max_ms}ms per leg")
         print(f"  Dry run           : {self.is_dry_run()}")
         session = requests.Session()
         sec = wc.interval_seconds
@@ -4144,7 +3429,7 @@ def create_dashboard(bots):
     layout.split_column(
         Layout(
             Panel(
-                f"[bold cyan]EMILIANO BOT — Spread Capture / Legacy[/bold cyan]\n"
+                f"[bold cyan]EMILIANO BOT — Spread Capture[/bold cyan]\n"
                 f"Schedule ({_tz_label}): {_schedule_str}",
                 style="bold green", box=box.ROUNDED,
             ),
@@ -4162,51 +3447,23 @@ def create_dashboard(bots):
         pnl_dollars, pnl_pct, pnl_color = bot.get_current_pnl()
         listener_cd = bot.get_listener_countdown()
 
-        # Status label
-        if bot.trade_state == TradeState.FILLED and bot.position_side:
-            display_status = f"{bot.position_side} FILLED"
-        elif bot.trade_state == TradeState.EXITING:
-            display_status = "EXITING"
-        elif bot.trade_state == TradeState.CLOSED:
-            display_status = "CLOSED"
-        elif bot.trade_state == TradeState.ERROR:
-            display_status = "ERROR"
-        else:
-            display_status = d.get('status', 'WAITING')
-
+        display_status = d.get("status", "WAITING")
         cd = asset_cooldown.get_status(bot.asset_type, bot.window_slug)
         if cd.get("cooldown_active"):
             rem = cd.get("cooldown_remaining_sec", 0)
             display_status = f"COOLDOWN {rem // 60}m{rem % 60:02d}s"
 
-        delta_pct = d.get("price_delta", 0.0)
-        if bot.worker_config.strategy == "spread_capture":
-            edge = d.get("spread_edge", 0.0)
-            comb = d.get("combined_bid_c", 0)
-            ratio_text = (
-                f"[cyan]edge {edge:.4f}[/cyan] "
-                f"(comb {comb}c / thr {bot.worker_config.spread_threshold:.3f})"
-            )
-            strategy_text = f" | caps={d.get('spread_captures', 0)}"
-        else:
-            mom_sig = d.get("momentum_signal", "NEUTRAL")
-            if "BULL" in mom_sig:
-                ratio_text = f"[bold green]{mom_sig}[/bold green]"
-            elif "BEAR" in mom_sig:
-                ratio_text = f"[bold red]{mom_sig}[/bold red]"
-            elif mom_sig == "STALE":
-                ratio_text = f"[yellow]{mom_sig}[/yellow]"
-            else:
-                ratio_text = f"[white]{mom_sig} (Δ {delta_pct:+.3f}%)[/white]"
-            strategy_text = f" | {bot.worker_config.execution_mode}"
+        edge = d.get("spread_edge", 0.0)
+        comb = d.get("combined_bid_c", 0)
+        ratio_text = (
+            f"[cyan]edge {edge*100:.2f}c[/cyan] "
+            f"(bids {comb}c / need >{bot.worker_config.spread_threshold*100:.1f}c)"
+        )
+        strategy_text = f" | caps={d.get('spread_captures', 0)}"
 
-        # Card border color based on trade state
-        if bot.trade_state == TradeState.FILLED:
-            card_color = "cyan"
-        elif bot.trade_state in (TradeState.EXITING, TradeState.CLOSED):
-            card_color = "green"
-        else:
-            card_color = "blue"
+        inv_y = d.get("yes_shares", 0)
+        inv_n = d.get("no_shares", 0)
+        card_color = "cyan" if inv_y > 0 or inv_n > 0 else "blue"
 
         # Time window label
         if bot.active_market and bot.active_market.get("expiry"):
@@ -4219,26 +3476,11 @@ def create_dashboard(bots):
         else:
             time_window = "Waiting for market..."
 
-        # Position text
-        if bot.position_side and bot.entry_price > 0:
-            bought_text = (
-                f"[b]{bot.position_side} filled:[/] {bot.entry_price*100:.1f}c "
-                f"×{bot.position_size:.2f}"
-            )
-        elif bot.worker_config.strategy == "spread_capture":
-            inv_y = d.get("yes_shares", 0)
-            inv_n = d.get("no_shares", 0)
-            bought_text = (
-                f"[dim]spread | size={bot.worker_config.spread_size} sh | "
-                f"edge>{bot.worker_config.spread_threshold:.3f} | "
-                f"inv Y{inv_y}/N{inv_n}[/dim]"
-            )
-        else:
-            bought_text = (
-                f"[dim]{bot.worker_config.strategy} | "
-                f"size={bot.worker_config.legacy_size} sh | "
-                f"min≥{bot.worker_config.min_entry_price*100:.0f}c[/dim]"
-            )
+        bought_text = (
+            f"[dim]spread | order={bot.worker_config.spread_size} sh | "
+            f"max={bot.worker_config.max_shares} sh/leg | "
+            f"inv Y{inv_y}/N{inv_n}[/dim]"
+        )
 
         cd_pnl_color = "red" if cd.get("cooldown_window_pnl", 0) < 0 else "green"
         cd_blocked   = " | [bold red]ENTRIES BLOCKED[/bold red]" if cd.get("cooldown_active") else ""
@@ -4442,15 +3684,11 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        print("🚀 Starting EmilianoBot — Spread Capture Mode...")
+        print("🚀 Starting EmilianoBot — Spread Capture...")
         for wc in WORKER_CONFIGS:
-            if wc.strategy == "spread_capture":
-                print(f"   {wc.asset.upper()} {wc.window}: {wc.strategy} "
-                      f"| edge>{wc.spread_threshold:.3f} | size={wc.spread_size} "
-                      f"| dry_run={wc.dry_run}")
-            else:
-                print(f"   {wc.asset.upper()} {wc.window}: {wc.strategy} / {wc.execution_mode} "
-                      f"| size={wc.legacy_size} | dry_run={wc.dry_run}")
+            print(f"   {wc.asset.upper()} {wc.window}: edge>{wc.spread_threshold:.3f} "
+                  f"| order={wc.spread_size} | max={wc.max_shares}/leg "
+                  f"| dry_run={wc.dry_run}")
         asyncio.run(main())
     except KeyboardInterrupt:
         console.print("\n[bold yellow]👋 EmilianoBot shutting down...[/bold yellow]")

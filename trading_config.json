@@ -1,18 +1,16 @@
 {
   "defaults": {
-    "strategy": "spread_capture",
     "spread_threshold": 0.03,
     "trade_cooldown_ms": 3000,
     "spread_size": 10,
     "max_order_size": 10,
+    "max_shares": 10.2,
     "price_bias": 0.01,
     "dry_run": null,
+    "dry_run_fill_delay_min_ms": 200,
+    "dry_run_fill_delay_max_ms": 2500,
     "listener_activate_secs": null,
-    "entry_seconds_left": null,
-    "min_entry_price": 0.90,
-    "stop_loss_pct": 35,
-    "take_profit_pct": 35,
-    "legacy_size": 10
+    "entry_seconds_left": null
   },
   "workers": [
     { "asset": "btc", "window": "5m", "enabled": true },
