@@ -3309,6 +3309,18 @@ class MarketWorker:
 
     # ── Market scanner ─────────────────────────────────────────────────
 
+    def _interval_seconds(self) -> int:
+        return self.worker_config.interval_seconds
+
+    def _interval_start(self, ts: int) -> int:
+        sec = self._interval_seconds()
+        return (ts // sec) * sec
+
+    def current_interval_starts(self, now_ts: Optional[int] = None) -> Tuple[int, int]:
+        now = now_ts if now_ts is not None else int(datetime.now(timezone.utc).timestamp())
+        base = self._interval_start(now)
+        return base, base + self._interval_seconds()
+
     def get_candidate_markets(self, asset: Optional[str] = None) -> list:
         slug_asset = (asset or self.asset_type).lower()
         now       = int(datetime.now(timezone.utc).timestamp())
